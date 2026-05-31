@@ -97,9 +97,10 @@ export OAI_AMMSE_CE_PRINT_EVERY=100
 export OAI_CE_NMSE_PERIOD=100
 export OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD=1
 export OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL=Rayleigh8
-export OAI_AMMSE_CE_RFSIM_SPEED_KMH=30
+export OAI_AMMSE_CE_RFSIM_SPEED_KMH=0
 export OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB=-70
 export OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}"
+export OAI_CE_NMSE_ALLOW_TIME_VARYING=0
 
 "${PYTHON_BIN}" -c 'import numpy, torch'
 ```
@@ -131,6 +132,7 @@ sudo -E env \
   OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv \
   OAI_CE_NMSE_ENABLE=1 \
   OAI_CE_NMSE_PERIOD="${OAI_CE_NMSE_PERIOD}" \
+  OAI_CE_NMSE_ALLOW_TIME_VARYING="${OAI_CE_NMSE_ALLOW_TIME_VARYING}" \
   OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv \
   tools/ammse_ce_service/run_oai_with_elastic_ammse.sh \
     --rfsim \
@@ -274,13 +276,17 @@ controls:
 - `OAI_AMMSE_CE_PRINT_EVERY`: Python service progress print interval in served
   requests. Set `0` to disable periodic service prints.
 - `OAI_CE_NMSE_PERIOD`: C-side NMSE log/CSV period in PUSCH events.
+- `OAI_CE_NMSE_ALLOW_TIME_VARYING`: set `1` only if you want approximate
+  debug NMSE values for a time-varying RFsim channel. Strict RFsim NMSE is valid
+  only when the uplink channel is static.
 - `OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD`: set `1` to append
   `--rfsimulator.[0].options chanmod`.
 - `OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL`: RFsim uplink channel model, for example
   `Rayleigh8`.
 - `OAI_AMMSE_CE_RFSIM_SPEED_KMH`: mobile speed. The wrapper converts it to
   `max_Doppler` using `OAI_AMMSE_CE_RFSIM_CARRIER_HZ`, default
-  `3619200000`.
+  `3619200000`. Keep this at `0` for strict CE NMSE validation. Set it to a
+  non-zero value, for example `30`, only for mobility stress tests.
 - `OAI_AMMSE_CE_RFSIM_MAX_DOPPLER_HZ`: explicit Doppler override. If set, it
   takes precedence over `OAI_AMMSE_CE_RFSIM_SPEED_KMH`.
 - `OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB`: RFsim channel `noise_power_dB` for
@@ -305,6 +311,16 @@ channel for the scheduled PUSCH grid. The gNB command must enable
 `rfsimu_channel_ue0`/`rfsimu_channel_enB0` descriptors and the logger reports
 `CE NMSE logger has no RFsim true channel`. A-MMSE inference still runs in that
 case, but strict true-channel NMSE is unavailable.
+
+Strict NMSE also requires a static RFsim uplink channel. With non-zero
+`OAI_AMMSE_CE_RFSIM_SPEED_KMH` or `OAI_AMMSE_CE_RFSIM_MAX_DOPPLER_HZ`, RFsim
+updates the channel taps over time. The PUSCH estimator sees the channel snapshot
+used for the received samples, but the lightweight logger can only read the
+current RFsim descriptor later. The logger therefore skips strict NMSE by
+default for time-varying RFsim channels. Set
+`OAI_CE_NMSE_ALLOW_TIME_VARYING=1` only if you explicitly want those
+approximate debug numbers; they can legitimately swing above `0 dB` because the
+reference is not a slot-aligned true channel.
 
 ## Useful RFsim Configs
 

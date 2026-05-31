@@ -215,8 +215,10 @@ typedef struct {
 typedef struct {
   bool init_done;
   bool enabled;
+  bool allow_time_varying;
   bool warned_unsupported;
   bool warned_channel;
+  bool warned_time_varying;
   bool warned_thread;
   unsigned int period;
   unsigned int seen;
@@ -392,6 +394,7 @@ static void oai_ce_nmse_init(void)
   state->enabled = env_flag_enabled("OAI_CE_NMSE_ENABLE") || env_flag_enabled("OAI_CE_NMSE");
   if (!state->enabled)
     return;
+  state->allow_time_varying = env_flag_enabled("OAI_CE_NMSE_ALLOW_TIME_VARYING");
 
   const char *period = getenv("OAI_CE_NMSE_PERIOD");
   if (period != NULL && period[0] != '\0') {
@@ -484,6 +487,19 @@ static void oai_ce_nmse_maybe_enqueue(PHY_VARS_gNB *gNB,
             desc->channel_length,
             OAI_CE_NMSE_MAX_TAPS);
       state->warned_channel = true;
+    }
+    return;
+  }
+  if (!state->allow_time_varying && desc->max_Doppler > 0.0 && desc->forgetting_factor < 1.0) {
+    if (!state->warned_time_varying) {
+      LOG_W(PHY,
+            "CE NMSE logger skipped for time-varying RFsim channel %s: max_Doppler=%.3f Hz, forgetfact=%.6f. "
+            "Strict NMSE needs a static RFsim channel snapshot; set OAI_CE_NMSE_ALLOW_TIME_VARYING=1 only for approximate "
+            "debug values.\n",
+            desc->model_name != NULL ? desc->model_name : "(unnamed)",
+            desc->max_Doppler,
+            desc->forgetting_factor);
+      state->warned_time_varying = true;
     }
     return;
   }
