@@ -6,6 +6,7 @@ OAI_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 NR_SOFTMODEM="${NR_SOFTMODEM:-${OAI_ROOT}/cmake_targets/ran_build_local/build/nr-softmodem}"
+OAI_BUILD_DIR="$(cd "$(dirname "${NR_SOFTMODEM}")" && pwd)"
 SOCKET_PATH="${OAI_AMMSE_CE_SOCKET:-/tmp/oai_ammse_ce.sock}"
 METHOD="${OAI_AMMSE_CE_METHOD:-strujepa}"
 WIDTH="${OAI_AMMSE_CE_WIDTH:-1.0}"
@@ -44,6 +45,16 @@ if [[ -n "${OAI_CE_NMSE_CSV:-}" ]]; then
 fi
 printf 'width=%s depth=%s\n' "${WIDTH}" "${DEPTH}" > "${SUBNET_FILE}"
 
+if ! "${PYTHON_BIN}" - <<'PY'
+import numpy  # noqa: F401
+import torch  # noqa: F401
+PY
+then
+  echo "Python interpreter cannot import numpy and torch: ${PYTHON_BIN}" >&2
+  echo "Set PYTHON_BIN to the absolute path of the Python environment used for the A-MMSE service." >&2
+  exit 1
+fi
+
 service_args=(
   "${SCRIPT_DIR}/serve_elastic_ammse_ce.py"
   --method "${METHOD}"
@@ -66,6 +77,13 @@ if [[ -n "${OAI_AMMSE_CE_NOISE_POWER_DB:-}" ]]; then
   service_args+=(--noise-power-db "${OAI_AMMSE_CE_NOISE_POWER_DB}")
 fi
 
+print_service_log_tail() {
+  if [[ -s "${SERVICE_LOG}" ]]; then
+    echo "--- tail -80 ${SERVICE_LOG} ---" >&2
+    tail -n 80 "${SERVICE_LOG}" >&2 || true
+  fi
+}
+
 rm -f -- "${SOCKET_PATH}"
 "${PYTHON_BIN}" "${service_args[@]}" > "${SERVICE_LOG}" 2>&1 &
 service_pid=$!
@@ -82,6 +100,7 @@ for _ in $(seq 1 $((START_TIMEOUT_S * 20))); do
   fi
   if ! kill -0 "${service_pid}" >/dev/null 2>&1; then
     echo "A-MMSE CE service exited before socket became ready. Log: ${SERVICE_LOG}" >&2
+    print_service_log_tail
     exit 1
   fi
   sleep 0.05
@@ -89,9 +108,11 @@ done
 
 if [[ ! -S "${SOCKET_PATH}" ]]; then
   echo "A-MMSE CE service socket was not created: ${SOCKET_PATH}. Log: ${SERVICE_LOG}" >&2
+  print_service_log_tail
   exit 1
 fi
 
+export LD_LIBRARY_PATH="${OAI_BUILD_DIR}:${LD_LIBRARY_PATH:-}"
 export OAI_AMMSE_CE_SOCKET="${SOCKET_PATH}"
 export OAI_AMMSE_CE_WIDTH="${WIDTH}"
 export OAI_AMMSE_CE_DEPTH="${DEPTH}"

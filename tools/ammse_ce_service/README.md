@@ -64,7 +64,8 @@ this build layout works without extra environment variables:
 
 ```bash
 cmake -S . -B cmake_targets/ran_build_local/build -GNinja
-cmake --build cmake_targets/ran_build_local/build --target nr-softmodem nr-uesoftmodem rfsimulator
+cmake --build cmake_targets/ran_build_local/build --target \
+  nr-softmodem nr-uesoftmodem rfsimulator params_libconfig
 ```
 
 If you build with OAI's standard `cmake_targets/build_oai` flow instead, set
@@ -88,14 +89,18 @@ Alternatively keep the checkpoint anywhere and pass its absolute path with
 3. Configure the Python service environment.
 
 ```bash
-export PYTHON_BIN=python3
+export OAI_BUILD_DIR=/home/users/dky/openairinterface5g/cmake_targets/ran_build_local/build
+export LD_LIBRARY_PATH="${OAI_BUILD_DIR}:${LD_LIBRARY_PATH:-}"
+export PYTHON_BIN="$(python -c 'import sys; print(sys.executable)')"
 export OAI_AMMSE_CE_CHECKPOINT=/home/users/dky/openairinterface5g/tools/ammse_ce_service/checkpoints/strujepa_best.pt
 
 "${PYTHON_BIN}" -c 'import numpy, torch'
 ```
 
-The last command is a quick dependency check for the Python service. The
-service imports its own runtime code from `tools/ammse_ce_service`.
+Use the absolute Python path from the active environment. Passing plain
+`python3` through `sudo` can select the system Python, which may not have
+`numpy` or `torch`. The last command is a quick dependency check for the Python
+service. The service imports its own runtime code from `tools/ammse_ce_service`.
 
 4. Start the gNB through the A-MMSE wrapper.
 
@@ -105,6 +110,7 @@ the socket/subnet variables, and then starts `nr-softmodem`.
 ```bash
 sudo -E env \
   PYTHON_BIN="${PYTHON_BIN}" \
+  LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
   OAI_AMMSE_CE_METHOD=strujepa \
   OAI_AMMSE_CE_CHECKPOINT="${OAI_AMMSE_CE_CHECKPOINT}" \
   OAI_AMMSE_CE_WIDTH=0.25 \
@@ -124,8 +130,10 @@ sudo -E env \
 ```
 
 Use `sudo -E env ...` if your OAI run needs sudo; it preserves the variables the
-wrapper and Python service need. The wrapper removes stale default `/tmp`
-subnet, service-log, service-CSV, metrics-CSV, and NMSE-CSV files before
+wrapper and Python service need. The wrapper also adds the `nr-softmodem` build
+directory to `LD_LIBRARY_PATH`, but exporting it here makes the same setting
+available to commands you run outside the wrapper. It removes stale default
+`/tmp` subnet, service-log, service-CSV, metrics-CSV, and NMSE-CSV files before
 starting, because root may be unable to truncate user-owned files in sticky
 directories such as `/tmp` on systems with `fs.protected_regular` enabled.
 
@@ -134,7 +142,9 @@ directories such as `/tmp` on systems with `fs.protected_regular` enabled.
 ```bash
 cd /home/users/dky/openairinterface5g
 
-sudo -E cmake_targets/ran_build_local/build/nr-uesoftmodem \
+sudo -E env \
+  LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
+  "${OAI_BUILD_DIR}/nr-uesoftmodem" \
   --rfsim \
   --phy-test \
   --noS1 \
