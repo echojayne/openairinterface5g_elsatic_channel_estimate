@@ -288,6 +288,7 @@ static void ce_nmse_compute(const oai_ce_nmse_sample_t *sample,
                             double *applied_nmse_db,
                             double *oai_inter_nmse_db,
                             double *raw_dmrs_nmse_db,
+                            double *raw_dmrs_all_re_nmse_db,
                             int *raw_support)
 {
   double applied_err = 0.0;
@@ -296,6 +297,8 @@ static void ce_nmse_compute(const oai_ce_nmse_sample_t *sample,
   double oai_inter_ref = 0.0;
   double raw_err = 0.0;
   double raw_ref = 0.0;
+  double raw_all_err = 0.0;
+  double raw_all_ref = 0.0;
   int raw_count = 0;
   for (int rel_symbol = 0; rel_symbol < sample->nr_symbols; rel_symbol++) {
     for (int k = 0; k < sample->nb_re; k++) {
@@ -318,6 +321,10 @@ static void ce_nmse_compute(const oai_ce_nmse_sample_t *sample,
       }
 
       const c16_t raw = sample->raw_dmrs_grid[idx];
+      const double raw_all_dr = (double)raw.r - true_re;
+      const double raw_all_di = (double)raw.i - true_im;
+      raw_all_err += raw_all_dr * raw_all_dr + raw_all_di * raw_all_di;
+      raw_all_ref += true_re * true_re + true_im * true_im;
       if (raw.r != 0 || raw.i != 0) {
         const double raw_dr = (double)raw.r - true_re;
         const double raw_di = (double)raw.i - true_im;
@@ -330,6 +337,7 @@ static void ce_nmse_compute(const oai_ce_nmse_sample_t *sample,
   *applied_nmse_db = ce_nmse_db(applied_err, applied_ref);
   *oai_inter_nmse_db = sample->has_oai_inter_grid ? ce_nmse_db(oai_inter_err, oai_inter_ref) : NAN;
   *raw_dmrs_nmse_db = ce_nmse_db(raw_err, raw_ref);
+  *raw_dmrs_all_re_nmse_db = ce_nmse_db(raw_all_err, raw_all_ref);
   *raw_support = raw_count;
 }
 
@@ -351,11 +359,13 @@ static void *ce_nmse_thread_main(void *arg)
     double applied_db = NAN;
     double oai_inter_db = NAN;
     double raw_db = NAN;
+    double raw_all_db = NAN;
     int raw_support = 0;
-    ce_nmse_compute(&sample, &applied_db, &oai_inter_db, &raw_db, &raw_support);
+    ce_nmse_compute(&sample, &applied_db, &oai_inter_db, &raw_db, &raw_all_db, &raw_support);
     const bool is_ammse = strncmp(sample.method_label, "ammse", strlen("ammse")) == 0;
     LOG_I(PHY,
-          "CE_NMSE frame=%u slot=%u method=%s %s=%.3f dB oai_inter_all_re=%.3f dB raw_dmrs=%.3f dB raw_re=%d "
+          "CE_NMSE frame=%u slot=%u method=%s %s=%.3f dB oai_inter_all_re=%.3f dB raw_dmrs=%.3f dB "
+          "raw_dmrs_all_re=%.3f dB raw_re=%d "
           "grid_re=%d dropped=%u\n",
           sample.frame,
           sample.slot,
@@ -364,18 +374,20 @@ static void *ce_nmse_thread_main(void *arg)
           applied_db,
           oai_inter_db,
           raw_db,
+          raw_all_db,
           raw_support,
           sample.grid_elems,
           dropped);
     if (state->csv_fp != NULL) {
       fprintf(state->csv_fp,
-              "%u,%u,%s,%.6f,%.6f,%.6f,%d,%d,%u\n",
+              "%u,%u,%s,%.6f,%.6f,%.6f,%.6f,%d,%d,%u\n",
               sample.frame,
               sample.slot,
               sample.method_label,
               applied_db,
               oai_inter_db,
               raw_db,
+              raw_all_db,
               raw_support,
               sample.grid_elems,
               dropped);
@@ -407,8 +419,8 @@ static void oai_ce_nmse_init(void)
     state->csv_fp = fopen(csv_path, "w");
     if (state->csv_fp != NULL) {
       fprintf(state->csv_fp,
-              "frame,slot,method,applied_all_re_nmse_db,oai_inter_all_re_nmse_db,raw_dmrs_nmse_db,raw_dmrs_re,grid_re,"
-              "dropped\n");
+              "frame,slot,method,applied_all_re_nmse_db,oai_inter_all_re_nmse_db,raw_dmrs_nmse_db,"
+              "raw_dmrs_all_re_nmse_db,raw_dmrs_re,grid_re,dropped\n");
       fflush(state->csv_fp);
     } else {
       LOG_W(PHY, "failed to open OAI_CE_NMSE_CSV=%s: %s\n", csv_path, strerror(errno));
@@ -822,6 +834,46 @@ static void apply_ammse_ce_grid(NR_gNB_PUSCH *pusch_vars,
     }
   }
 }
+
+#if T_TRACER
+static void copy_oai_inter_trace_grid_for_nmse(const NR_DL_FRAME_PARMS *frame_parms,
+                                               const nfapi_nr_pusch_pdu_t *rel15_ul,
+                                               const c16_t *oai_inter_stream,
+                                               int chest_time,
+                                               c16_t *dst_grid)
+{
+  const int nb_re = rel15_ul->rb_size * NR_NB_SC_PER_RB;
+  const int grid_elems = nb_re * rel15_ul->nr_of_symbols;
+  const int start_symbol = rel15_ul->start_symbol_index;
+  const int end_symbol = start_symbol + rel15_ul->nr_of_symbols;
+  memset(dst_grid, 0, sizeof(*dst_grid) * grid_elems);
+
+  for (int rel_symbol = 0; rel_symbol < rel15_ul->nr_of_symbols; rel_symbol++) {
+    const int symbol = start_symbol + rel_symbol;
+    const int dmrs_symbol_flag = (rel15_ul->ul_dmrs_symb_pos >> symbol) & 0x01;
+    int dmrs_symbol = 0;
+    if (chest_time == 0)
+      dmrs_symbol = dmrs_symbol_flag ? symbol : get_valid_dmrs_idx_for_channel_est(rel15_ul->ul_dmrs_symb_pos, symbol);
+    else
+      dmrs_symbol = get_next_dmrs_symbol_in_slot(rel15_ul->ul_dmrs_symb_pos, start_symbol, end_symbol);
+
+    const c16_t *src_symbol = &oai_inter_stream[dmrs_symbol * frame_parms->ofdm_symbol_size];
+    c16_t *dst_symbol = &dst_grid[rel_symbol * nb_re];
+    if (dmrs_symbol_flag == 0) {
+      memcpy(dst_symbol, src_symbol, sizeof(c16_t) * nb_re);
+    } else if (rel15_ul->dmrs_config_type == pusch_dmrs_type1) {
+      for (int idx = 1; idx < nb_re; idx += 2)
+        *dst_symbol++ = src_symbol[idx];
+    } else {
+      for (int idx = 0; idx < nb_re; idx++) {
+        if (idx % 6 == 0 || idx % 6 == 1)
+          continue;
+        *dst_symbol++ = src_symbol[idx];
+      }
+    }
+  }
+}
+#endif
 
 static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
                                      NR_gNB_PUSCH *pusch_vars,
@@ -2192,21 +2244,8 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
 #if T_TRACER
   c16_t *oai_inter_grid_for_nmse = NULL;
   if (oai_ce_nmse_enabled() && rel15_ul->nrOfLayers == 1 && frame_parms->nb_antennas_rx == 1) {
-    const int nb_re_for_nmse = rel15_ul->rb_size * NR_NB_SC_PER_RB;
     const c16_t *oai_inter_stream = (const c16_t *)pusch_vars->ul_ch_estimates[0];
-    for (int rel_symbol = 0; rel_symbol < rel15_ul->nr_of_symbols; rel_symbol++) {
-      const int symbol = rel15_ul->start_symbol_index + rel_symbol;
-      int dmrs_symbol = 0;
-      if (gNB->chest_time == 0) {
-        const int dmrs_symbol_flag = (rel15_ul->ul_dmrs_symb_pos >> symbol) & 0x01;
-        dmrs_symbol = dmrs_symbol_flag ? symbol : get_valid_dmrs_idx_for_channel_est(rel15_ul->ul_dmrs_symb_pos, symbol);
-      } else {
-        dmrs_symbol = get_next_dmrs_symbol_in_slot(rel15_ul->ul_dmrs_symb_pos, rel15_ul->start_symbol_index, end_symbol);
-      }
-      const c16_t *src_symbol = &oai_inter_stream[dmrs_symbol * frame_parms->ofdm_symbol_size];
-      c16_t *dst_symbol = &oai_inter_ch_est_slot_mem[rel_symbol * nb_re_for_nmse];
-      memcpy(dst_symbol, src_symbol, sizeof(c16_t) * nb_re_for_nmse);
-    }
+    copy_oai_inter_trace_grid_for_nmse(frame_parms, rel15_ul, oai_inter_stream, gNB->chest_time, oai_inter_ch_est_slot_mem);
     oai_inter_grid_for_nmse = oai_inter_ch_est_slot_mem;
   }
 #endif

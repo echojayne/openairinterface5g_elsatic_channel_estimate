@@ -306,7 +306,12 @@ export OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv
 
 The NMSE logger compares the applied channel estimate, the stock OAI
 interpolated estimate, and raw DMRS-position LS estimates against the RFsim true
-channel for the scheduled PUSCH grid. The gNB command must enable
+channel for the scheduled PUSCH grid. `ammse_all_re` and `oai_inter_all_re` use
+the same all-RE replay convention as `rayleigh8_pareto_all_re_grid.png`:
+`oai_inter_all_re` follows the T-tracer `raw-inter-ce-fd-data` layout, so REs
+not emitted by OAI's extractor remain zero. `raw_dmrs` is the raw LS estimate on
+the DMRS support only, while `raw_dmrs_all_re` is the sparse raw-DMRS all-RE
+baseline used by the replay plots. The gNB command must enable
 `'--rfsimulator.[0].options' chanmod`; otherwise RFsim does not allocate the
 `rfsimu_channel_ue0`/`rfsimu_channel_enB0` descriptors and the logger reports
 `CE NMSE logger has no RFsim true channel`. A-MMSE inference still runs in that
