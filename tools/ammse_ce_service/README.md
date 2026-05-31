@@ -36,6 +36,14 @@ Set `STRUJEPA_ROOT` if the StruJEPA tree is not at `/home/users/dky/StruJEPA`:
 export STRUJEPA_ROOT=/path/to/StruJEPA
 ```
 
+## Checkpoint
+
+The StruJEPA elastic A-MMSE checkpoint is hosted outside this public fork:
+
+```text
+https://drive.google.com/file/d/1ctv2xhcmAQQqUn-MK4KIZ_gcfd1cS1C2/view?usp=drive_link
+```
+
 Put a trained checkpoint at `tools/ammse_ce_service/checkpoints/strujepa_best.pt`
 or pass one explicitly:
 
