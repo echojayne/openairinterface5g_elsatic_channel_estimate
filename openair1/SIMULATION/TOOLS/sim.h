@@ -22,6 +22,8 @@ The present clause specifies several numerical functions for testing of digital 
 */
 
 #define NB_SAMPLES_CHANNEL_OFFSET 4
+#define CHANNEL_DESC_SNAPSHOT_RING 64
+#define CHANNEL_DESC_SNAPSHOT_MAX_TAPS 2048
 
 typedef enum {
   UNSPECIFIED_MODID=0,
@@ -126,6 +128,12 @@ typedef struct {
   float *Doppler_phase_cur;
   /// flag indicating if channel direction is UL or DL
   bool is_uplink;
+  /// RFsim-applied channel snapshots keyed by sample timestamp for online CE NMSE
+  uint64_t snapshot_start_timestamp[CHANNEL_DESC_SNAPSHOT_RING];
+  uint64_t snapshot_end_timestamp[CHANNEL_DESC_SNAPSHOT_RING];
+  int snapshot_channel_length[CHANNEL_DESC_SNAPSHOT_RING];
+  uint64_t snapshot_write_index;
+  struct complexd snapshot_ch[CHANNEL_DESC_SNAPSHOT_RING][CHANNEL_DESC_SNAPSHOT_MAX_TAPS];
 } channel_desc_t;
 
 typedef struct {

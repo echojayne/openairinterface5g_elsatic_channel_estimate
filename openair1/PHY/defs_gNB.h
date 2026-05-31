@@ -303,6 +303,8 @@ typedef struct gNB_L1_proc_t_s {
   uint8_t CC_id;
   /// timestamp received from HW
   openair0_timestamp_t timestamp_rx;
+  /// timestamp received from RF device before local timing offset correction
+  openair0_timestamp_t rf_timestamp_rx;
   /// timestamp to send to "slave rru"
   openair0_timestamp_t timestamp_tx;
   /// slot to act upon for reception
@@ -554,6 +556,8 @@ union ldpcReqUnion {
 typedef struct processingData_L1 {
   int frame_rx;
   int slot_rx;
+  openair0_timestamp_t timestamp_rx;
+  openair0_timestamp_t rf_timestamp_rx;
   openair0_timestamp_t timestamp_tx;
   PHY_VARS_gNB *gNB;
   notifiedFIFO_elt_t *elt;
@@ -564,6 +568,8 @@ typedef struct processingData_L1tx {
   int slot;
   int frame_rx;
   int slot_rx;
+  openair0_timestamp_t timestamp_rx;
+  openair0_timestamp_t rf_timestamp_rx;
   openair0_timestamp_t timestamp_tx;
   PHY_VARS_gNB *gNB;
 } processingData_L1tx_t;

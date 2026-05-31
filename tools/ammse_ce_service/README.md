@@ -100,7 +100,6 @@ export OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL=Rayleigh8
 export OAI_AMMSE_CE_RFSIM_SPEED_KMH=0
 export OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB=-70
 export OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}"
-export OAI_CE_NMSE_ALLOW_TIME_VARYING=0
 
 "${PYTHON_BIN}" -c 'import numpy, torch'
 ```
@@ -132,7 +131,6 @@ sudo -E env \
   OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv \
   OAI_CE_NMSE_ENABLE=1 \
   OAI_CE_NMSE_PERIOD="${OAI_CE_NMSE_PERIOD}" \
-  OAI_CE_NMSE_ALLOW_TIME_VARYING="${OAI_CE_NMSE_ALLOW_TIME_VARYING}" \
   OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv \
   tools/ammse_ce_service/run_oai_with_elastic_ammse.sh \
     --rfsim \
@@ -265,8 +263,24 @@ Set `OAI_AMMSE_CE_METRICS` to write C-side request timing and status:
 export OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv
 ```
 
-The Python service writes request latency and subnet information to
-`OAI_AMMSE_CE_SERVICE_CSV`.
+The metrics CSV writes one row for each A-MMSE request:
+
+- `c_ce_total_us`: C-side wall time for the PUSCH channel-estimation block,
+  including native DMRS estimation, optional A-MMSE replacement, and NMSE queue
+  enqueue.
+- `c_service_wall_us`: C-side wall time spent sending the request to the Python
+  service and receiving the dense CE grid back.
+- `python_total_us`: Python service time from after the request header is read
+  through model execution and response packing.
+- `python_model_us`: Python model inference time only.
+- `ipc_gap_us`: `c_service_wall_us - python_total_us`. Treat this as the
+  socket/process scheduling/serialization gap, not a pure IPC-only number.
+- `status`: `0` means the A-MMSE replacement was applied. Negative values mean
+  the hook attempted a request but the service response was not usable.
+
+The Python service writes matching request latency and subnet information to
+`OAI_AMMSE_CE_SERVICE_CSV`. Its `total_us` includes response sending; the
+`python_total_us` column is the value returned to the C process.
 
 ## Channel and Print Controls
 
@@ -276,17 +290,14 @@ controls:
 - `OAI_AMMSE_CE_PRINT_EVERY`: Python service progress print interval in served
   requests. Set `0` to disable periodic service prints.
 - `OAI_CE_NMSE_PERIOD`: C-side NMSE log/CSV period in PUSCH events.
-- `OAI_CE_NMSE_ALLOW_TIME_VARYING`: set `1` only if you want approximate
-  debug NMSE values for a time-varying RFsim channel. Strict RFsim NMSE is valid
-  only when the uplink channel is static.
 - `OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD`: set `1` to append
   `--rfsimulator.[0].options chanmod`.
 - `OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL`: RFsim uplink channel model, for example
   `Rayleigh8`.
 - `OAI_AMMSE_CE_RFSIM_SPEED_KMH`: mobile speed. The wrapper converts it to
   `max_Doppler` using `OAI_AMMSE_CE_RFSIM_CARRIER_HZ`, default
-  `3619200000`. Keep this at `0` for strict CE NMSE validation. Set it to a
-  non-zero value, for example `30`, only for mobility stress tests.
+  `3619200000`. Set it to `0` for static-channel validation or to a non-zero
+  value, for example `30`, for mobility stress tests.
 - `OAI_AMMSE_CE_RFSIM_MAX_DOPPLER_HZ`: explicit Doppler override. If set, it
   takes precedence over `OAI_AMMSE_CE_RFSIM_SPEED_KMH`.
 - `OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB`: RFsim channel `noise_power_dB` for
@@ -317,15 +328,21 @@ baseline used by the replay plots. The gNB command must enable
 `CE NMSE logger has no RFsim true channel`. A-MMSE inference still runs in that
 case, but strict true-channel NMSE is unavailable.
 
-Strict NMSE also requires a static RFsim uplink channel. With non-zero
-`OAI_AMMSE_CE_RFSIM_SPEED_KMH` or `OAI_AMMSE_CE_RFSIM_MAX_DOPPLER_HZ`, RFsim
-updates the channel taps over time. The PUSCH estimator sees the channel snapshot
-used for the received samples, but the lightweight logger can only read the
-current RFsim descriptor later. The logger therefore skips strict NMSE by
-default for time-varying RFsim channels. Set
-`OAI_CE_NMSE_ALLOW_TIME_VARYING=1` only if you explicitly want those
-approximate debug numbers; they can legitimately swing above `0 dB` because the
-reference is not a slot-aligned true channel.
+The NMSE CSV contains a `ref_source` column:
+
+- `rfsim_ts`: strict RFsim reference. The gNB matched the PUSCH receive
+  timestamp to a timestamped RFsim shared-memory channel snapshot and copied
+  that snapshot into the NMSE sample at the channel-estimation entry point.
+- `current`: fallback RFsim descriptor. This is only meaningful for static or
+  effectively static channels. Time-varying RFsim strict NMSE should use
+  `rfsim_ts` rows.
+
+For time-varying RFsim channels, the logger no longer evaluates against the
+later "current" descriptor. If no timestamped RFsim snapshot is available for
+the PUSCH receive timestamp, or if the raw DMRS-position estimate is empty, that
+sample is skipped. This keeps online NMSE aligned with the channel snapshot used
+by the received PUSCH samples and avoids the misleading `0 dB` rows that appear
+when the UE is not yet connected or has already exited.
 
 ## Useful RFsim Configs
 

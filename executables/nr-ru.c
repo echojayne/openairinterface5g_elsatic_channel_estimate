@@ -998,6 +998,8 @@ void *ru_thread(void *param)
                                          .slot = proc->tti_tx,
                                          .frame_rx = proc->frame_rx,
                                          .slot_rx = proc->tti_rx,
+                                         .timestamp_rx = proc->timestamp_rx,
+                                         .rf_timestamp_rx = proc->timestamp_rx + ru->ts_offset,
                                          .timestamp_tx = proc->timestamp_tx};
     pushNotifiedFIFO(&gNB->L1_tx_out, resTx);
   }
@@ -1473,4 +1475,3 @@ static void NRRCconfig_RU(configmodule_interface_t *cfg)
   } // j=0..num_rus
   return;
 }
-

@@ -192,7 +192,9 @@ def serve(args: argparse.Namespace) -> int:
         log_path = Path(args.log_csv).expanduser().resolve()
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("w", encoding="utf-8")
-        log_handle.write("request_id,frame,slot,grid_elems,model_us,total_us,method,label,width,depth,noise_power_db\n")
+        log_handle.write(
+            "request_id,frame,slot,grid_elems,model_us,python_total_us,total_us,method,label,width,depth,noise_power_db\n"
+        )
         log_handle.flush()
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -263,6 +265,7 @@ def serve(args: argparse.Namespace) -> int:
                         status = 2
                         model_us = 0
                         response_payload = b""
+                    python_total_us = int(round((time.perf_counter() - request_t0) * 1.0e6))
                     resp = RESPONSE.pack(
                         MAGIC,
                         VERSION,
@@ -271,7 +274,7 @@ def serve(args: argparse.Namespace) -> int:
                         int(status),
                         int(header["grid_elems"]) if status == 0 else 0,
                         int(model_us),
-                        0,
+                        int(python_total_us),
                     )
                     send_all(conn, resp)
                     if status == 0:
@@ -281,7 +284,7 @@ def serve(args: argparse.Namespace) -> int:
                     if log_handle is not None:
                         log_handle.write(
                             f"{header['request_id']},{header['frame']},{header['slot']},{header['grid_elems']},"
-                            f"{model_us},{total_us},{args.method},"
+                            f"{model_us},{python_total_us},{total_us},{args.method},"
                             f"w{request_width:g}_d{request_depth:g},{request_width},{request_depth},{args.noise_power_db}\n"
                         )
                         log_handle.flush()
@@ -293,6 +296,7 @@ def serve(args: argparse.Namespace) -> int:
                                     "count": served,
                                     "request_id": header["request_id"],
                                     "model_us": model_us,
+                                    "python_total_us": python_total_us,
                                     "total_us": total_us,
                                     "width": request_width,
                                     "depth": request_depth,

@@ -2,6 +2,10 @@
  * SPDX-License-Identifier: LicenseRef-CSSL-1.0
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "PHY/defs_gNB.h"
 #include "PHY/phy_extern.h"
 #include "nr_transport_proto.h"
@@ -18,8 +22,10 @@
 #include "T_messages_creator.h"
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <stdint.h>
@@ -30,9 +36,12 @@
 #include <time.h>
 #include <math.h>
 #include <pthread.h>
+#include <dlfcn.h>
+#include <link.h>
 
 #if T_TRACER
 #include "SIMULATION/TOOLS/sim.h"
+#include "radio/rfsimulator/rfsimulator.h"
 #endif
 
 #if T_TRACER
@@ -152,8 +161,26 @@ typedef struct {
   uint32_t status;
   uint32_t grid_elems;
   uint32_t model_us;
-  uint32_t reserved;
+  uint32_t python_total_us;
 } oai_ammse_ce_response_header_t;
+
+typedef struct {
+  bool attempted;
+  uint32_t request_id;
+  uint32_t frame;
+  uint32_t slot;
+  uint32_t rb_size;
+  uint32_t nr_symbols;
+  uint32_t grid_elems;
+  double width;
+  double depth;
+  int status;
+  uint64_t c_service_wall_us;
+  uint32_t python_model_us;
+  uint32_t python_total_us;
+  int64_t ipc_gap_us;
+  int max_ch;
+} oai_ammse_ce_timing_t;
 
 typedef struct {
   bool init_done;
@@ -191,6 +218,17 @@ static void oai_ammse_ce_load_subnet_from_file(oai_ammse_ce_state_t *state);
 
 typedef struct {
   bool valid;
+  bool timestamped;
+  int channel_length;
+  double sample_rate_hz;
+  double path_loss_linear;
+  double max_doppler_hz;
+  double forgetting_factor;
+  struct complexd taps[OAI_CE_NMSE_MAX_TAPS];
+} oai_ce_nmse_channel_snapshot_t;
+
+typedef struct {
+  bool valid;
   uint32_t frame;
   uint8_t slot;
   int rb_size;
@@ -204,6 +242,9 @@ typedef struct {
   int channel_length;
   double sample_rate_hz;
   double path_loss_linear;
+  double max_doppler_hz;
+  double forgetting_factor;
+  bool timestamped_snapshot;
   char method_label[64];
   bool has_oai_inter_grid;
   c16_t applied_grid[OAI_CE_NMSE_MAX_GRID_ELEMS];
@@ -215,7 +256,6 @@ typedef struct {
 typedef struct {
   bool init_done;
   bool enabled;
-  bool allow_time_varying;
   bool warned_unsupported;
   bool warned_channel;
   bool warned_time_varying;
@@ -255,6 +295,117 @@ static bool env_flag_enabled(const char *name)
     return false;
   return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0
          && strcasecmp(value, "off") != 0;
+}
+
+typedef bool (*rfsimulator_get_uplink_channel_snapshot_fn_t)(uint64_t timestamp, rfsimulator_channel_snapshot_t *snapshot);
+
+static rfsimulator_channel_snapshot_shm_t *get_rfsimulator_snapshot_shm(void)
+{
+  static rfsimulator_channel_snapshot_shm_t *shm = NULL;
+  if (shm != NULL)
+    return shm;
+
+  char name[64];
+  snprintf(name, sizeof(name), "/oai_rfsim_ul_ch_snapshot_%ld", (long)getpid());
+  int fd = shm_open(name, O_RDONLY, 0600);
+  if (fd < 0)
+    return NULL;
+  void *mapped = mmap(NULL, sizeof(rfsimulator_channel_snapshot_shm_t), PROT_READ, MAP_SHARED, fd, 0);
+  close(fd);
+  if (mapped == MAP_FAILED)
+    return NULL;
+  shm = (rfsimulator_channel_snapshot_shm_t *)mapped;
+  if (shm->magic != RFSIMULATOR_CHANNEL_SNAPSHOT_SHM_MAGIC || shm->version != RFSIMULATOR_CHANNEL_SNAPSHOT_SHM_VERSION) {
+    munmap(shm, sizeof(rfsimulator_channel_snapshot_shm_t));
+    shm = NULL;
+  }
+  return shm;
+}
+
+static bool copy_rfsimulator_snapshot_from_shm(openair0_timestamp_t rx_timestamp,
+                                               uint64_t rx_timestamp_period,
+                                               oai_ce_nmse_channel_snapshot_t *snapshot,
+                                               oai_ce_nmse_state_t *state)
+{
+  rfsimulator_channel_snapshot_shm_t *shm = get_rfsimulator_snapshot_shm();
+  if (shm == NULL || rx_timestamp < 0)
+    return false;
+  const uint64_t write_index = __atomic_load_n(&shm->write_index, __ATOMIC_ACQUIRE);
+  const uint64_t count = write_index < RFSIMULATOR_CHANNEL_SNAPSHOT_RING ? write_index : RFSIMULATOR_CHANNEL_SNAPSHOT_RING;
+  for (uint64_t offset = 0; offset < count; offset++) {
+    const uint64_t idx = (write_index + RFSIMULATOR_CHANNEL_SNAPSHOT_RING - 1 - offset) % RFSIMULATOR_CHANNEL_SNAPSHOT_RING;
+    const rfsimulator_channel_snapshot_t *candidate = &shm->snapshots[idx];
+    if (!candidate->valid || candidate->channel_length <= 0 || candidate->channel_length > OAI_CE_NMSE_MAX_TAPS)
+      continue;
+    bool timestamp_match = (uint64_t)rx_timestamp >= candidate->start_timestamp
+                           && (uint64_t)rx_timestamp < candidate->end_timestamp;
+    if (!timestamp_match && rx_timestamp_period > 0) {
+      const uint64_t target_mod = (uint64_t)rx_timestamp % rx_timestamp_period;
+      const uint64_t start_mod = candidate->start_timestamp % rx_timestamp_period;
+      const uint64_t end_mod = candidate->end_timestamp % rx_timestamp_period;
+      timestamp_match = start_mod <= end_mod ? (target_mod >= start_mod && target_mod < end_mod)
+                                             : (target_mod >= start_mod || target_mod < end_mod);
+    }
+    if (!timestamp_match)
+      continue;
+    snapshot->valid = true;
+    snapshot->timestamped = true;
+    snapshot->channel_length = candidate->channel_length;
+    snapshot->sample_rate_hz = candidate->sampling_rate * 1e6;
+    snapshot->path_loss_linear = pow(10.0, candidate->path_loss_dB / 20.0);
+    snapshot->max_doppler_hz = candidate->max_Doppler;
+    snapshot->forgetting_factor = candidate->forgetting_factor;
+    memcpy(snapshot->taps, candidate->taps, sizeof(struct complexd) * candidate->channel_length);
+    if (candidate->max_Doppler > 0.0 && candidate->forgetting_factor < 1.0 && !state->warned_time_varying) {
+      LOG_I(PHY,
+            "CE NMSE logger uses timestamped RFsim shared-memory snapshots: rx_ts=%lld snapshot=[%llu,%llu) "
+            "max_Doppler=%.3f Hz, forgetfact=%.6f\n",
+            (long long)rx_timestamp,
+            (unsigned long long)candidate->start_timestamp,
+            (unsigned long long)candidate->end_timestamp,
+            candidate->max_Doppler,
+            candidate->forgetting_factor);
+      state->warned_time_varying = true;
+    }
+    return true;
+  }
+  return false;
+}
+
+typedef struct {
+  void *handle;
+} rfsimulator_dlopen_search_t;
+
+static int find_loaded_rfsimulator_cb(struct dl_phdr_info *info, size_t size, void *data)
+{
+  (void)size;
+  rfsimulator_dlopen_search_t *search = (rfsimulator_dlopen_search_t *)data;
+  if (info == NULL || info->dlpi_name == NULL || info->dlpi_name[0] == '\0')
+    return 0;
+  if (strstr(info->dlpi_name, "librfsimulator.so") == NULL)
+    return 0;
+  search->handle = dlopen(info->dlpi_name, RTLD_NOW);
+  return search->handle != NULL ? 1 : 0;
+}
+
+static rfsimulator_get_uplink_channel_snapshot_fn_t get_rfsimulator_snapshot_fn(void)
+{
+  static bool looked_up = false;
+  static rfsimulator_get_uplink_channel_snapshot_fn_t fn = NULL;
+  if (!looked_up) {
+    void *self = dlopen(NULL, RTLD_NOW);
+    if (self != NULL)
+      fn = (rfsimulator_get_uplink_channel_snapshot_fn_t)dlsym(self, "rfsimulator_get_uplink_channel_snapshot");
+    if (fn == NULL) {
+      rfsimulator_dlopen_search_t search = {0};
+      dl_iterate_phdr(find_loaded_rfsimulator_cb, &search);
+      void *rfsim = search.handle != NULL ? search.handle : dlopen("librfsimulator.so", RTLD_NOW);
+      if (rfsim != NULL)
+        fn = (rfsimulator_get_uplink_channel_snapshot_fn_t)dlsym(rfsim, "rfsimulator_get_uplink_channel_snapshot");
+    }
+    looked_up = true;
+  }
+  return fn;
 }
 
 static double ce_nmse_db(double err_power, double ref_power)
@@ -364,12 +515,13 @@ static void *ce_nmse_thread_main(void *arg)
     ce_nmse_compute(&sample, &applied_db, &oai_inter_db, &raw_db, &raw_all_db, &raw_support);
     const bool is_ammse = strncmp(sample.method_label, "ammse", strlen("ammse")) == 0;
     LOG_I(PHY,
-          "CE_NMSE frame=%u slot=%u method=%s %s=%.3f dB oai_inter_all_re=%.3f dB raw_dmrs=%.3f dB "
+          "CE_NMSE frame=%u slot=%u method=%s ref=%s %s=%.3f dB oai_inter_all_re=%.3f dB raw_dmrs=%.3f dB "
           "raw_dmrs_all_re=%.3f dB raw_re=%d "
           "grid_re=%d dropped=%u\n",
           sample.frame,
           sample.slot,
           sample.method_label,
+          sample.timestamped_snapshot ? "rfsim_ts" : "current",
           is_ammse ? "ammse_all_re" : "oai_inter_all_re",
           applied_db,
           oai_inter_db,
@@ -380,10 +532,11 @@ static void *ce_nmse_thread_main(void *arg)
           dropped);
     if (state->csv_fp != NULL) {
       fprintf(state->csv_fp,
-              "%u,%u,%s,%.6f,%.6f,%.6f,%.6f,%d,%d,%u\n",
+              "%u,%u,%s,%s,%.6f,%.6f,%.6f,%.6f,%d,%d,%u\n",
               sample.frame,
               sample.slot,
               sample.method_label,
+              sample.timestamped_snapshot ? "rfsim_ts" : "current",
               applied_db,
               oai_inter_db,
               raw_db,
@@ -406,7 +559,6 @@ static void oai_ce_nmse_init(void)
   state->enabled = env_flag_enabled("OAI_CE_NMSE_ENABLE") || env_flag_enabled("OAI_CE_NMSE");
   if (!state->enabled)
     return;
-  state->allow_time_varying = env_flag_enabled("OAI_CE_NMSE_ALLOW_TIME_VARYING");
 
   const char *period = getenv("OAI_CE_NMSE_PERIOD");
   if (period != NULL && period[0] != '\0') {
@@ -419,7 +571,7 @@ static void oai_ce_nmse_init(void)
     state->csv_fp = fopen(csv_path, "w");
     if (state->csv_fp != NULL) {
       fprintf(state->csv_fp,
-              "frame,slot,method,applied_all_re_nmse_db,oai_inter_all_re_nmse_db,raw_dmrs_nmse_db,"
+              "frame,slot,method,ref_source,applied_all_re_nmse_db,oai_inter_all_re_nmse_db,raw_dmrs_nmse_db,"
               "raw_dmrs_all_re_nmse_db,raw_dmrs_re,grid_re,dropped\n");
       fflush(state->csv_fp);
     } else {
@@ -446,13 +598,130 @@ bool oai_ce_nmse_enabled(void)
   return oai_ce_nmse_state.enabled;
 }
 
+static bool oai_ce_nmse_capture_channel_snapshot(openair0_timestamp_t rx_timestamp,
+                                                 uint64_t rx_timestamp_period,
+                                                 oai_ce_nmse_channel_snapshot_t *snapshot)
+{
+  if (snapshot == NULL)
+    return false;
+  memset(snapshot, 0, sizeof(*snapshot));
+  if (!oai_ce_nmse_enabled())
+    return false;
+
+  oai_ce_nmse_state_t *state = &oai_ce_nmse_state;
+  if (copy_rfsimulator_snapshot_from_shm(rx_timestamp, rx_timestamp_period, snapshot, state))
+    return true;
+
+  rfsimulator_get_uplink_channel_snapshot_fn_t get_snapshot = get_rfsimulator_snapshot_fn();
+  if (rx_timestamp >= 0 && get_snapshot != NULL) {
+    rfsimulator_channel_snapshot_t rf_snapshot;
+    memset(&rf_snapshot, 0, sizeof(rf_snapshot));
+    if (get_snapshot((uint64_t)rx_timestamp, &rf_snapshot)) {
+      snapshot->valid = true;
+      snapshot->timestamped = true;
+      snapshot->channel_length = rf_snapshot.channel_length;
+      snapshot->sample_rate_hz = rf_snapshot.sampling_rate * 1e6;
+      snapshot->path_loss_linear = pow(10.0, rf_snapshot.path_loss_dB / 20.0);
+      snapshot->max_doppler_hz = rf_snapshot.max_Doppler;
+      snapshot->forgetting_factor = rf_snapshot.forgetting_factor;
+      memcpy(snapshot->taps, rf_snapshot.taps, sizeof(struct complexd) * rf_snapshot.channel_length);
+      if (rf_snapshot.max_Doppler > 0.0 && rf_snapshot.forgetting_factor < 1.0 && !state->warned_time_varying) {
+        LOG_I(PHY,
+              "CE NMSE logger uses timestamped RFsim channel snapshots for time-varying channel: rx_ts=%lld "
+              "max_Doppler=%.3f Hz, forgetfact=%.6f\n",
+              (long long)rx_timestamp,
+              rf_snapshot.max_Doppler,
+              rf_snapshot.forgetting_factor);
+        state->warned_time_varying = true;
+      }
+      return true;
+    }
+  }
+
+  channel_desc_t *desc = get_rfsim_uplink_channel_desc();
+  if (desc == NULL || desc->ch == NULL || desc->channel_length <= 0 || desc->sampling_rate <= 0.0 || desc->nb_rx < 1
+      || desc->nb_tx < 1 || desc->ch[0] == NULL) {
+    if (!state->warned_channel) {
+      LOG_W(PHY, "CE NMSE logger has no RFsim true channel; strict NMSE cannot be computed\n");
+      state->warned_channel = true;
+    }
+    return false;
+  }
+  if (desc->channel_length > OAI_CE_NMSE_MAX_TAPS) {
+    if (!state->warned_channel) {
+      LOG_W(PHY,
+            "CE NMSE logger channel_length=%d exceeds max=%d; strict NMSE disabled for this run\n",
+            desc->channel_length,
+            OAI_CE_NMSE_MAX_TAPS);
+      state->warned_channel = true;
+    }
+    return false;
+  }
+  if (rx_timestamp >= 0 && desc->snapshot_write_index > 0) {
+    const uint64_t count = desc->snapshot_write_index < CHANNEL_DESC_SNAPSHOT_RING ? desc->snapshot_write_index
+                                                                                   : CHANNEL_DESC_SNAPSHOT_RING;
+    for (uint64_t offset = 0; offset < count; offset++) {
+      const uint64_t idx = (desc->snapshot_write_index + CHANNEL_DESC_SNAPSHOT_RING - 1 - offset) % CHANNEL_DESC_SNAPSHOT_RING;
+      if (desc->snapshot_channel_length[idx] <= 0 || desc->snapshot_channel_length[idx] > OAI_CE_NMSE_MAX_TAPS)
+        continue;
+      if ((uint64_t)rx_timestamp < desc->snapshot_start_timestamp[idx]
+          || (uint64_t)rx_timestamp >= desc->snapshot_end_timestamp[idx])
+        continue;
+      snapshot->valid = true;
+      snapshot->timestamped = true;
+      snapshot->channel_length = desc->snapshot_channel_length[idx];
+      snapshot->sample_rate_hz = desc->sampling_rate * 1e6;
+      snapshot->path_loss_linear = pow(10.0, desc->path_loss_dB / 20.0);
+      snapshot->max_doppler_hz = desc->max_Doppler;
+      snapshot->forgetting_factor = desc->forgetting_factor;
+      memcpy(snapshot->taps, desc->snapshot_ch[idx], sizeof(struct complexd) * desc->snapshot_channel_length[idx]);
+      if (desc->max_Doppler > 0.0 && desc->forgetting_factor < 1.0 && !state->warned_time_varying) {
+        LOG_I(PHY,
+              "CE NMSE logger uses timestamped RFsim channel snapshots for time-varying channel %s: rx_ts=%lld "
+              "snapshot=[%llu,%llu) max_Doppler=%.3f Hz, forgetfact=%.6f\n",
+              desc->model_name != NULL ? desc->model_name : "(unnamed)",
+              (long long)rx_timestamp,
+              (unsigned long long)desc->snapshot_start_timestamp[idx],
+              (unsigned long long)desc->snapshot_end_timestamp[idx],
+              desc->max_Doppler,
+              desc->forgetting_factor);
+        state->warned_time_varying = true;
+      }
+      return true;
+    }
+  }
+  if (desc->max_Doppler > 0.0 && desc->forgetting_factor < 1.0 && !state->warned_time_varying) {
+    LOG_W(PHY,
+          "CE NMSE logger could not find a timestamped RFsim snapshot for rx_ts=%lld; skipping strict NMSE for "
+          "time-varying channel %s: max_Doppler=%.3f Hz, forgetfact=%.6f\n",
+          (long long)rx_timestamp,
+          desc->model_name != NULL ? desc->model_name : "(unnamed)",
+          desc->max_Doppler,
+          desc->forgetting_factor);
+    state->warned_time_varying = true;
+  }
+  if (desc->max_Doppler > 0.0 && desc->forgetting_factor < 1.0)
+    return false;
+
+  snapshot->valid = true;
+  snapshot->timestamped = false;
+  snapshot->channel_length = desc->channel_length;
+  snapshot->sample_rate_hz = desc->sampling_rate * 1e6;
+  snapshot->path_loss_linear = pow(10.0, desc->path_loss_dB / 20.0);
+  snapshot->max_doppler_hz = desc->max_Doppler;
+  snapshot->forgetting_factor = desc->forgetting_factor;
+  memcpy(snapshot->taps, desc->ch[0], sizeof(struct complexd) * desc->channel_length);
+  return true;
+}
+
 static void oai_ce_nmse_maybe_enqueue(PHY_VARS_gNB *gNB,
                                       NR_gNB_PUSCH *pusch_vars,
                                       uint32_t frame,
                                       uint8_t slot,
                                       const nfapi_nr_pusch_pdu_t *rel15_ul,
                                       const c16_t *pusch_ch_est_dmrs_pos_slot_mem,
-                                      const c16_t *oai_inter_grid)
+                                      const c16_t *oai_inter_grid,
+                                      const oai_ce_nmse_channel_snapshot_t *channel_snapshot)
 {
   if (!oai_ce_nmse_enabled())
     return;
@@ -483,38 +752,20 @@ static void oai_ce_nmse_maybe_enqueue(PHY_VARS_gNB *gNB,
     return;
   }
 
-  channel_desc_t *desc = get_rfsim_uplink_channel_desc();
-  if (desc == NULL || desc->ch == NULL || desc->channel_length <= 0 || desc->sampling_rate <= 0.0 || desc->nb_rx < 1
-      || desc->nb_tx < 1 || desc->ch[0] == NULL) {
-    if (!state->warned_channel) {
-      LOG_W(PHY, "CE NMSE logger has no RFsim true channel; strict NMSE cannot be computed\n");
-      state->warned_channel = true;
-    }
+  if (channel_snapshot == NULL || !channel_snapshot->valid) {
     return;
   }
-  if (desc->channel_length > OAI_CE_NMSE_MAX_TAPS) {
-    if (!state->warned_channel) {
-      LOG_W(PHY,
-            "CE NMSE logger channel_length=%d exceeds max=%d; strict NMSE disabled for this run\n",
-            desc->channel_length,
-            OAI_CE_NMSE_MAX_TAPS);
-      state->warned_channel = true;
+
+  const c16_t *raw_src = &pusch_ch_est_dmrs_pos_slot_mem[rel15_ul->start_symbol_index * nb_re];
+  bool has_raw_dmrs = false;
+  for (int i = 0; i < grid_elems; i++) {
+    if (raw_src[i].r != 0 || raw_src[i].i != 0) {
+      has_raw_dmrs = true;
+      break;
     }
-    return;
   }
-  if (!state->allow_time_varying && desc->max_Doppler > 0.0 && desc->forgetting_factor < 1.0) {
-    if (!state->warned_time_varying) {
-      LOG_W(PHY,
-            "CE NMSE logger skipped for time-varying RFsim channel %s: max_Doppler=%.3f Hz, forgetfact=%.6f. "
-            "Strict NMSE needs a static RFsim channel snapshot; set OAI_CE_NMSE_ALLOW_TIME_VARYING=1 only for approximate "
-            "debug values.\n",
-            desc->model_name != NULL ? desc->model_name : "(unnamed)",
-            desc->max_Doppler,
-            desc->forgetting_factor);
-      state->warned_time_varying = true;
-    }
+  if (!has_raw_dmrs)
     return;
-  }
 
   if (pthread_mutex_trylock(&state->mutex) != 0) {
     __sync_fetch_and_add(&state->dropped, 1);
@@ -539,9 +790,12 @@ static void oai_ce_nmse_maybe_enqueue(PHY_VARS_gNB *gNB,
   sample->start_sc = (rel15_ul->bwp_start + rel15_ul->rb_start) * NR_NB_SC_PER_RB;
   sample->n_rb_ul = frame_parms->N_RB_UL;
   sample->subcarrier_spacing = rel15_ul->subcarrier_spacing;
-  sample->channel_length = desc->channel_length;
-  sample->sample_rate_hz = desc->sampling_rate * 1e6;
-  sample->path_loss_linear = pow(10.0, desc->path_loss_dB / 20.0);
+  sample->channel_length = channel_snapshot->channel_length;
+  sample->sample_rate_hz = channel_snapshot->sample_rate_hz;
+  sample->path_loss_linear = channel_snapshot->path_loss_linear;
+  sample->max_doppler_hz = channel_snapshot->max_doppler_hz;
+  sample->forgetting_factor = channel_snapshot->forgetting_factor;
+  sample->timestamped_snapshot = channel_snapshot->timestamped;
 
   const char *label = getenv("OAI_CE_NMSE_LABEL");
   if ((label == NULL || label[0] == '\0') && oai_ammse_ce_applied_for_current_pusch)
@@ -560,7 +814,6 @@ static void oai_ce_nmse_maybe_enqueue(PHY_VARS_gNB *gNB,
     snprintf(sample->method_label, sizeof(sample->method_label), "%s", label);
   }
 
-  const c16_t *raw_src = &pusch_ch_est_dmrs_pos_slot_mem[rel15_ul->start_symbol_index * nb_re];
   memcpy(sample->raw_dmrs_grid, raw_src, sizeof(c16_t) * grid_elems);
   if (oai_inter_grid != NULL) {
     sample->has_oai_inter_grid = true;
@@ -574,7 +827,7 @@ static void oai_ce_nmse_maybe_enqueue(PHY_VARS_gNB *gNB,
     c16_t *dst_symbol = &sample->applied_grid[rel_symbol * nb_re];
     memcpy(dst_symbol, src_symbol, sizeof(c16_t) * nb_re);
   }
-  memcpy(sample->taps, desc->ch[0], sizeof(struct complexd) * desc->channel_length);
+  memcpy(sample->taps, channel_snapshot->taps, sizeof(struct complexd) * channel_snapshot->channel_length);
 
   state->head = (state->head + 1) % OAI_CE_NMSE_QUEUE_DEPTH;
   state->count++;
@@ -719,7 +972,8 @@ static void oai_ammse_ce_init(void)
     state->metrics_fp = fopen(metrics_path, "w");
     if (state->metrics_fp != NULL) {
       fprintf(state->metrics_fp,
-              "request_id,frame,slot,rb_size,nr_symbols,grid_elems,width,depth,status,wall_us,model_us,max_ch\n");
+              "request_id,frame,slot,rb_size,nr_symbols,grid_elems,width,depth,status,c_ce_total_us,"
+              "c_service_wall_us,python_total_us,python_model_us,ipc_gap_us,max_ch\n");
       fflush(state->metrics_fp);
     } else {
       LOG_W(PHY, "failed to open OAI_AMMSE_CE_METRICS=%s: %s\n", metrics_path, strerror(errno));
@@ -730,6 +984,31 @@ static void oai_ammse_ce_init(void)
         state->socket_path,
         oai_ammse_ce_ppm_to_value(state->width_ppm),
         oai_ammse_ce_ppm_to_value(state->depth_ppm));
+}
+
+static void oai_ammse_ce_record_metrics(const oai_ammse_ce_timing_t *timing, uint64_t c_ce_total_us)
+{
+  oai_ammse_ce_state_t *state = &oai_ammse_ce_state;
+  if (state->metrics_fp == NULL || timing == NULL || !timing->attempted)
+    return;
+  fprintf(state->metrics_fp,
+          "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%d,%llu,%llu,%u,%u,%lld,%d\n",
+          timing->request_id,
+          timing->frame,
+          timing->slot,
+          timing->rb_size,
+          timing->nr_symbols,
+          timing->grid_elems,
+          timing->width,
+          timing->depth,
+          timing->status,
+          (unsigned long long)c_ce_total_us,
+          (unsigned long long)timing->c_service_wall_us,
+          timing->python_total_us,
+          timing->python_model_us,
+          (long long)timing->ipc_gap_us,
+          timing->max_ch);
+  fflush(state->metrics_fp);
 }
 
 bool oai_ammse_ce_enabled(void)
@@ -882,9 +1161,12 @@ static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
                                      const nfapi_nr_pusch_pdu_t *rel15_ul,
                                      uint32_t nvar,
                                      c16_t *pusch_ch_est_dmrs_pos_slot_mem,
-                                     int *max_ch)
+                                     int *max_ch,
+                                     oai_ammse_ce_timing_t *timing)
 {
   oai_ammse_ce_applied_for_current_pusch = false;
+  if (timing != NULL)
+    memset(timing, 0, sizeof(*timing));
   if (!oai_ammse_ce_enabled())
     return false;
   NR_DL_FRAME_PARMS *frame_parms = &gNB->frame_parms;
@@ -931,6 +1213,19 @@ static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
       .width_ppm = state->width_ppm,
       .depth_ppm = state->depth_ppm,
   };
+  if (timing != NULL) {
+    timing->attempted = true;
+    timing->request_id = req.request_id;
+    timing->frame = frame;
+    timing->slot = slot;
+    timing->rb_size = req.rb_size;
+    timing->nr_symbols = req.nr_symbols;
+    timing->grid_elems = req.grid_elems;
+    timing->width = oai_ammse_ce_ppm_to_value(req.width_ppm);
+    timing->depth = oai_ammse_ce_ppm_to_value(req.depth_ppm);
+    timing->status = -1;
+    timing->max_ch = *max_ch;
+  }
 
   const uint64_t t0 = monotonic_time_us();
   const c16_t *raw_grid = &pusch_ch_est_dmrs_pos_slot_mem[rel15_ul->start_symbol_index * nb_re];
@@ -946,48 +1241,24 @@ static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
   if (ok)
     ok = recv_all(state->fd, response_grid, sizeof(c16_t) * grid_elems);
   const uint64_t t1 = monotonic_time_us();
+  if (timing != NULL) {
+    timing->status = ok ? (int)resp.status : -1;
+    timing->c_service_wall_us = t1 - t0;
+    timing->python_model_us = resp.model_us;
+    timing->python_total_us = resp.python_total_us;
+    timing->ipc_gap_us = (int64_t)timing->c_service_wall_us - (int64_t)timing->python_total_us;
+    timing->max_ch = *max_ch;
+  }
   if (!ok) {
     LOG_W(PHY, "A-MMSE CE server request failed; falling back to OAI CE\n");
     oai_ammse_ce_close_socket();
-    if (state->metrics_fp != NULL) {
-      fprintf(state->metrics_fp,
-              "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%d,%llu,%u,%d\n",
-              req.request_id,
-              frame,
-              slot,
-              req.rb_size,
-              req.nr_symbols,
-              req.grid_elems,
-              oai_ammse_ce_ppm_to_value(req.width_ppm),
-              oai_ammse_ce_ppm_to_value(req.depth_ppm),
-              -1,
-              (unsigned long long)(t1 - t0),
-              resp.model_us,
-              *max_ch);
-      fflush(state->metrics_fp);
-    }
     return false;
   }
 
   apply_ammse_ce_grid(pusch_vars, frame_parms, rel15_ul, response_grid, max_ch);
   oai_ammse_ce_applied_for_current_pusch = true;
-  if (state->metrics_fp != NULL) {
-    fprintf(state->metrics_fp,
-            "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%u,%llu,%u,%d\n",
-            req.request_id,
-            frame,
-            slot,
-            req.rb_size,
-            req.nr_symbols,
-            req.grid_elems,
-            oai_ammse_ce_ppm_to_value(req.width_ppm),
-            oai_ammse_ce_ppm_to_value(req.depth_ppm),
-            resp.status,
-            (unsigned long long)(t1 - t0),
-            resp.model_us,
-            *max_ch);
-    fflush(state->metrics_fp);
-  }
+  if (timing != NULL)
+    timing->max_ch = *max_ch;
   return true;
 }
 
@@ -2153,6 +2424,20 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
   //----------------------------------------------------------
   //------------------- Channel estimation -------------------
   //----------------------------------------------------------
+  const uint64_t c_ce_t0 = monotonic_time_us();
+#if T_TRACER
+  oai_ce_nmse_channel_snapshot_t ce_nmse_channel_snapshot = {0};
+  if (oai_ce_nmse_enabled()) {
+    openair0_timestamp_t ce_rx_timestamp = gNB->proc.rf_timestamp_rx;
+    uint64_t ce_rx_timestamp_period = 0;
+    if (ce_rx_timestamp <= 0) {
+      ce_rx_timestamp = (openair0_timestamp_t)frame * frame_parms->samples_per_frame
+                        + (openair0_timestamp_t)get_samples_slot_timestamp(frame_parms, slot);
+      ce_rx_timestamp_period = (uint64_t)frame_parms->samples_per_frame * 1024ULL;
+    }
+    oai_ce_nmse_capture_channel_snapshot(ce_rx_timestamp, ce_rx_timestamp_period, &ce_nmse_channel_snapshot);
+  }
+#endif
   start_meas(&gNB->ulsch_channel_estimation_stats);
   int max_ch = 0;
   uint32_t nvar = 0;
@@ -2250,13 +2535,31 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
   }
 #endif
 
-  oai_ammse_ce_try_replace(gNB, pusch_vars, frame, slot, rel15_ul, nvar, pusch_ch_est_dmrs_pos_slot_mem, &max_ch);
+  oai_ammse_ce_timing_t ammse_ce_timing = {0};
+  oai_ammse_ce_try_replace(gNB,
+                           pusch_vars,
+                           frame,
+                           slot,
+                           rel15_ul,
+                           nvar,
+                           pusch_ch_est_dmrs_pos_slot_mem,
+                           &max_ch,
+                           &ammse_ce_timing);
 
 #if T_TRACER
-  oai_ce_nmse_maybe_enqueue(gNB, pusch_vars, frame, slot, rel15_ul, pusch_ch_est_dmrs_pos_slot_mem, oai_inter_grid_for_nmse);
+  oai_ce_nmse_maybe_enqueue(gNB,
+                            pusch_vars,
+                            frame,
+                            slot,
+                            rel15_ul,
+                            pusch_ch_est_dmrs_pos_slot_mem,
+                            oai_inter_grid_for_nmse,
+                            &ce_nmse_channel_snapshot);
 #endif
 
+  const uint64_t c_ce_t1 = monotonic_time_us();
   stop_meas(&gNB->ulsch_channel_estimation_stats);
+  oai_ammse_ce_record_metrics(&ammse_ce_timing, c_ce_t1 - c_ce_t0);
 
   start_meas(&gNB->rx_pusch_init_stats);
 

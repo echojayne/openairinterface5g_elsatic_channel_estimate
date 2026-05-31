@@ -14,8 +14,11 @@
 #include <cstdint>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -50,6 +53,97 @@ extern int get_currentchannels_type(const char *buf,
 #define PORT 4043 // default TCP port for this simulator
 #define sampleToByte(a, b) ((a) * (b) * sizeof(sample_t))
 #define byteToSample(a, b) ((a) / (sizeof(sample_t) * (b)))
+
+static constexpr int RFSIMULATOR_LOCAL_CHANNEL_SNAPSHOT_RING = 512;
+static std::mutex rfsim_uplink_channel_snapshot_mutex;
+static rfsimulator_channel_snapshot_t rfsim_uplink_channel_snapshots[RFSIMULATOR_LOCAL_CHANNEL_SNAPSHOT_RING];
+static uint64_t rfsim_uplink_channel_snapshot_widx = 0;
+static rfsimulator_channel_snapshot_shm_t *rfsim_uplink_channel_snapshot_shm = nullptr;
+
+static rfsimulator_channel_snapshot_shm_t *rfsimulator_get_snapshot_shm(void)
+{
+  if (rfsim_uplink_channel_snapshot_shm != nullptr)
+    return rfsim_uplink_channel_snapshot_shm;
+
+  char name[64];
+  snprintf(name, sizeof(name), "/oai_rfsim_ul_ch_snapshot_%ld", (long)getpid());
+  int fd = shm_open(name, O_CREAT | O_RDWR, 0600);
+  if (fd < 0)
+    return nullptr;
+  const size_t bytes = sizeof(rfsimulator_channel_snapshot_shm_t);
+  if (ftruncate(fd, bytes) != 0) {
+    close(fd);
+    return nullptr;
+  }
+  void *mapped = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (mapped == MAP_FAILED)
+    return nullptr;
+
+  rfsim_uplink_channel_snapshot_shm = static_cast<rfsimulator_channel_snapshot_shm_t *>(mapped);
+  rfsim_uplink_channel_snapshot_shm->magic = RFSIMULATOR_CHANNEL_SNAPSHOT_SHM_MAGIC;
+  rfsim_uplink_channel_snapshot_shm->version = RFSIMULATOR_CHANNEL_SNAPSHOT_SHM_VERSION;
+  return rfsim_uplink_channel_snapshot_shm;
+}
+
+static void rfsimulator_store_uplink_channel_snapshot(channel_desc_t *desc, uint64_t timestamp, int nsamps)
+{
+  if (desc == NULL || desc->ch == NULL || desc->ch[0] == NULL || desc->channel_length <= 0
+      || desc->channel_length > RFSIMULATOR_CHANNEL_SNAPSHOT_MAX_TAPS
+      || desc->channel_length > CHANNEL_DESC_SNAPSHOT_MAX_TAPS)
+    return;
+
+  const uint64_t desc_idx = desc->snapshot_write_index % CHANNEL_DESC_SNAPSHOT_RING;
+  desc->snapshot_start_timestamp[desc_idx] = timestamp;
+  desc->snapshot_end_timestamp[desc_idx] = timestamp + (uint64_t)std::max(nsamps, 1);
+  desc->snapshot_channel_length[desc_idx] = desc->channel_length;
+  memcpy(desc->snapshot_ch[desc_idx], desc->ch[0], sizeof(struct complexd) * desc->channel_length);
+  desc->snapshot_write_index++;
+
+  rfsimulator_channel_snapshot_t snapshot = {};
+  snapshot.valid = true;
+  snapshot.start_timestamp = timestamp;
+  snapshot.end_timestamp = timestamp + (uint64_t)std::max(nsamps, 1);
+  snapshot.channel_length = desc->channel_length;
+  snapshot.sampling_rate = desc->sampling_rate;
+  snapshot.path_loss_dB = desc->path_loss_dB;
+  snapshot.max_Doppler = desc->max_Doppler;
+  snapshot.forgetting_factor = desc->forgetting_factor;
+  memcpy(snapshot.taps, desc->ch[0], sizeof(struct complexd) * desc->channel_length);
+
+  rfsimulator_channel_snapshot_shm_t *shm = rfsimulator_get_snapshot_shm();
+  if (shm != nullptr) {
+    const uint64_t shm_idx = shm->write_index % RFSIMULATOR_CHANNEL_SNAPSHOT_RING;
+    snapshot.valid = false;
+    shm->snapshots[shm_idx] = snapshot;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    shm->snapshots[shm_idx].valid = true;
+    __atomic_store_n(&shm->write_index, shm->write_index + 1, __ATOMIC_RELEASE);
+  }
+
+  std::lock_guard<std::mutex> lock(rfsim_uplink_channel_snapshot_mutex);
+  rfsim_uplink_channel_snapshots[rfsim_uplink_channel_snapshot_widx % RFSIMULATOR_LOCAL_CHANNEL_SNAPSHOT_RING] = snapshot;
+  rfsim_uplink_channel_snapshot_widx++;
+}
+
+extern "C" bool rfsimulator_get_uplink_channel_snapshot(uint64_t timestamp, rfsimulator_channel_snapshot_t *snapshot)
+{
+  if (snapshot == NULL)
+    return false;
+
+  std::lock_guard<std::mutex> lock(rfsim_uplink_channel_snapshot_mutex);
+  const uint64_t count = std::min<uint64_t>(rfsim_uplink_channel_snapshot_widx, RFSIMULATOR_LOCAL_CHANNEL_SNAPSHOT_RING);
+  for (uint64_t offset = 0; offset < count; offset++) {
+    const uint64_t idx = (rfsim_uplink_channel_snapshot_widx + RFSIMULATOR_LOCAL_CHANNEL_SNAPSHOT_RING - 1 - offset)
+                         % RFSIMULATOR_LOCAL_CHANNEL_SNAPSHOT_RING;
+    const rfsimulator_channel_snapshot_t &candidate = rfsim_uplink_channel_snapshots[idx];
+    if (candidate.valid && timestamp >= candidate.start_timestamp && timestamp < candidate.end_timestamp) {
+      *snapshot = candidate;
+      return true;
+    }
+  }
+  return false;
+}
 
 #define GENERATE_CHANNEL 10 // each frame (or slot?) in DL
 #define MAX_FD_RFSIMU 250
@@ -1335,6 +1429,7 @@ static void rfsimulator_read_internal(rfsimulator_state_t *t,
                                rx_beam_id,
                                input);
 
+        rfsimulator_store_uplink_channel_snapshot(ptr->channel_model, timestamp, nsamps);
         for (int aarx = 0; aarx < nbAnt; aarx++) {
           rxAddInput(input, temp_array[aarx], aarx, ptr->channel_model, nsamps);
         }

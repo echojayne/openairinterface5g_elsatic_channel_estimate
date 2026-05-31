@@ -87,6 +87,8 @@ static void tx_func(processingData_L1tx_t *info)
   syncMsg->gNB = gNB;
   syncMsg->frame_rx = frame_rx;
   syncMsg->slot_rx = slot_rx;
+  syncMsg->timestamp_rx = info->timestamp_rx;
+  syncMsg->rf_timestamp_rx = info->rf_timestamp_rx;
   syncMsg->timestamp_tx = info->timestamp_tx;
   res->key = slot_rx;
   pushNotifiedFIFO(&gNB->resp_L1, res);
@@ -149,6 +151,8 @@ static void rx_func(processingData_L1_t *info)
   int frame_rx = info->frame_rx;
   int slot_rx = info->slot_rx;
   nfapi_nr_config_request_scf_t *cfg = &gNB->gNB_config;
+  gNB->proc.timestamp_rx = info->timestamp_rx;
+  gNB->proc.rf_timestamp_rx = info->rf_timestamp_rx;
 
   T(T_GNB_PHY_UL_TICK, T_INT(gNB->Mod_id), T_INT(frame_rx), T_INT(slot_rx));
 
@@ -197,6 +201,8 @@ static void rx_func(processingData_L1_t *info)
     syncMsg->gNB = gNB;
     syncMsg->frame_rx = frame_rx;
     syncMsg->slot_rx = slot_rx;
+    syncMsg->timestamp_rx = info->timestamp_rx;
+    syncMsg->rf_timestamp_rx = info->rf_timestamp_rx;
     res->key = slot_rx;
     LOG_D(NR_PHY, "Signaling completion for %d.%d (mod_slot %d) on L1_rx_out\n", frame_rx, slot_rx, slot_rx % RU_RX_SLOT_DEPTH);
     pushNotifiedFIFO(&gNB->L1_rx_out, res);
