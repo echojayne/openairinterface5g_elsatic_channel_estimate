@@ -125,6 +125,7 @@ sudo -E env \
     --noS1 \
     -O ci-scripts/conf_files/gnb.band78.106prb.rfsim.phytest-strujepa.conf \
     '--rfsimulator.[0].serveraddr' server \
+    '--rfsimulator.[0].options' chanmod \
     --T_stdout 2 \
     --T_nowait
 ```
@@ -263,7 +264,11 @@ export OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv
 
 The NMSE logger compares the applied channel estimate, the stock OAI
 interpolated estimate, and raw DMRS-position LS estimates against the RFsim true
-channel for the scheduled PUSCH grid.
+channel for the scheduled PUSCH grid. The gNB command must enable
+`'--rfsimulator.[0].options' chanmod`; otherwise RFsim does not allocate the
+`rfsimu_channel_ue0`/`rfsimu_channel_enB0` descriptors and the logger reports
+`CE NMSE logger has no RFsim true channel`. A-MMSE inference still runs in that
+case, but strict true-channel NMSE is unavailable.
 
 ## Useful RFsim Configs
 

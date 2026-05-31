@@ -53,12 +53,16 @@ static int16_t clip_true_channel_sample(double value)
 static channel_desc_t *get_rfsim_uplink_channel_desc(void)
 {
   static bool warned_missing_channel = false;
+  static bool lookup_disabled = false;
+  if (lookup_disabled)
+    return NULL;
   channel_desc_t *desc = find_channel_desc_fromname("rfsimu_channel_ue0");
   if (desc == NULL)
     desc = find_channel_desc_fromname("rfsimu_channel_enB0");
   if (desc == NULL && !warned_missing_channel) {
     LOG_W(PHY, "RFsim channel descriptor not found; true-channel trace will be zero\n");
     warned_missing_channel = true;
+    lookup_disabled = true;
   }
   return desc;
 }
