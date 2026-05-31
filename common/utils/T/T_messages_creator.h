@@ -106,13 +106,37 @@ void log_ul_fd_pusch_iq(int frame,
  * @param data_len Size of the data buffer in bytes
  */
 void log_ul_fd_chan_est_dmrs_interpl(int frame,
-                                    int slot,
-                                    const NR_DL_FRAME_PARMS *frame_parms,
-                                    const nfapi_nr_pusch_pdu_t *rel15_ul,
-                                    int number_dmrs_symbols,
-                                    int dmrs_port,
-                                    const c16_t *data,
-                                    int data_len);
+                                     int slot,
+                                     const NR_DL_FRAME_PARMS *frame_parms,
+                                     const nfapi_nr_pusch_pdu_t *rel15_ul,
+                                     int number_dmrs_symbols,
+                                     int dmrs_port,
+                                     const c16_t *data,
+                                     int data_len);
+
+/**
+ * @brief Log RFsim true PUSCH UL channel response using T-Tracer
+ *
+ * This function creates and sends a T_GNB_PHY_UL_FD_TRUE_CHANNEL message
+ * containing the RFsim true channel over the scheduled PUSCH grid.
+ *
+ * @param frame Frame number
+ * @param slot Slot number
+ * @param frame_parms Pointer to frame parameters structure
+ * @param rel15_ul Pointer to PUSCH PDU structure
+ * @param number_dmrs_symbols Number of DMRS symbols
+ * @param dmrs_port DMRS port number
+ * @param data Pointer to true channel data buffer (c16_t complex samples)
+ * @param data_len Size of the data buffer in bytes
+ */
+void log_ul_fd_true_channel(int frame,
+                            int slot,
+                            const NR_DL_FRAME_PARMS *frame_parms,
+                            const nfapi_nr_pusch_pdu_t *rel15_ul,
+                            int number_dmrs_symbols,
+                            int dmrs_port,
+                            const c16_t *data,
+                            int data_len);
 
 /**
  * @brief Log PUSCH UL received payload bits using T-Tracer

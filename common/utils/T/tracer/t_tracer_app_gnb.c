@@ -390,6 +390,7 @@ int main(int n, char **v)
                                                       "GNB_PHY_UL_FD_DMRS",
                                                       "GNB_PHY_UL_FD_CHAN_EST_DMRS_POS",
                                                       "GNB_PHY_UL_FD_CHAN_EST_DMRS_INTERPL",
+                                                      "GNB_PHY_UL_FD_TRUE_CHANNEL",
                                                       "GNB_PHY_UL_PAYLOAD_RX_BITS",
                                                       "UE_PHY_UL_SCRAMBLED_TX_BITS",
                                                       "UE_PHY_UL_PAYLOAD_TX_BITS"};

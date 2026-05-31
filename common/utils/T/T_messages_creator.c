@@ -109,10 +109,10 @@ void log_ul_fd_pusch_iq(int frame,
 }
 
 void log_ul_fd_chan_est_dmrs_interpl(int frame,
-                                    int slot,
-                                    const NR_DL_FRAME_PARMS *frame_parms,
-                                    const nfapi_nr_pusch_pdu_t *rel15_ul,
-                                    int number_dmrs_symbols,
+                                     int slot,
+                                     const NR_DL_FRAME_PARMS *frame_parms,
+                                     const nfapi_nr_pusch_pdu_t *rel15_ul,
+                                     int number_dmrs_symbols,
                                     int dmrs_port,
                                     const c16_t *data,
                                     int data_len)
@@ -122,9 +122,23 @@ void log_ul_fd_chan_est_dmrs_interpl(int frame,
                 number_dmrs_symbols, dmrs_port, 0, data, data_len);
 }
 
+void log_ul_fd_true_channel(int frame,
+                            int slot,
+                            const NR_DL_FRAME_PARMS *frame_parms,
+                            const nfapi_nr_pusch_pdu_t *rel15_ul,
+                            int number_dmrs_symbols,
+                            int dmrs_port,
+                            const c16_t *data,
+                            int data_len)
+{
+  log_ul_common(T_GNB_PHY_UL_FD_TRUE_CHANNEL,
+                frame, slot, frame_parms, rel15_ul,
+                number_dmrs_symbols, dmrs_port, 0, data, data_len);
+}
+
 void log_ul_payload_rx_bits(int frame,
-                           int slot,
-                           const NR_DL_FRAME_PARMS *frame_parms,
+                            int slot,
+                            const NR_DL_FRAME_PARMS *frame_parms,
                            const nfapi_nr_pusch_pdu_t *rel15_ul,
                            int number_dmrs_symbols,
                            int dmrs_port,

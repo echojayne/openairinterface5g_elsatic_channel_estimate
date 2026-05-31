@@ -17,14 +17,907 @@
 #include "T.h"
 #include "T_messages_creator.h"
 #include <sys/time.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <stdbool.h>
+#include <time.h>
+#include <math.h>
+#include <pthread.h>
 
+#if T_TRACER
+#include "SIMULATION/TOOLS/sim.h"
+#endif
 
 #if T_TRACER
 static void copy_c16_data_to_slot_memory(c16_t *src, c16_t *dst_slot, int nb_re_pusch, int symbol)
 {
   memcpy(&dst_slot[nb_re_pusch * symbol], src, nb_re_pusch * sizeof(c16_t));
 }
+
+static int16_t clip_true_channel_sample(double value)
+{
+  if (value > 32767.0)
+    return 32767;
+  if (value < -32768.0)
+    return -32768;
+  return (int16_t)lround(value);
+}
+
+static channel_desc_t *get_rfsim_uplink_channel_desc(void)
+{
+  static bool warned_missing_channel = false;
+  channel_desc_t *desc = find_channel_desc_fromname("rfsimu_channel_ue0");
+  if (desc == NULL)
+    desc = find_channel_desc_fromname("rfsimu_channel_enB0");
+  if (desc == NULL && !warned_missing_channel) {
+    LOG_W(PHY, "RFsim channel descriptor not found; true-channel trace will be zero\n");
+    warned_missing_channel = true;
+  }
+  return desc;
+}
+
+static void fill_rfsim_true_channel_slot(c16_t *dst_slot,
+                                         int nb_re_pusch,
+                                         const NR_DL_FRAME_PARMS *frame_parms,
+                                         const nfapi_nr_pusch_pdu_t *rel15_ul)
+{
+  channel_desc_t *desc = get_rfsim_uplink_channel_desc();
+  if (desc == NULL || desc->ch == NULL || desc->channel_length == 0 || desc->sampling_rate <= 0.0)
+    return;
+
+  const int nb_rx_ant = frame_parms->nb_antennas_rx;
+  const int nb_layer = rel15_ul->nrOfLayers;
+  if (desc->nb_rx < nb_rx_ant || desc->nb_tx < nb_layer)
+    return;
+
+  const double scs_hz = 15000.0 * (double)(1U << rel15_ul->subcarrier_spacing);
+  const double sample_rate_hz = desc->sampling_rate * 1e6;
+  const double path_loss_linear = pow(10.0, desc->path_loss_dB / 20.0);
+  const double ce_unit_scale = 364.0 * path_loss_linear;
+  const double two_pi = 6.28318530717958647692;
+  const int start_sc = (rel15_ul->bwp_start + rel15_ul->rb_start) * NR_NB_SC_PER_RB;
+  const int grid_sc = frame_parms->N_RB_UL * NR_NB_SC_PER_RB;
+  const int start_symbol = rel15_ul->start_symbol_index;
+  const int end_symbol = start_symbol + rel15_ul->nr_of_symbols;
+  const int stream_stride = frame_parms->symbols_per_slot * nb_re_pusch;
+
+  for (int aatx = 0; aatx < nb_layer; aatx++) {
+    for (int aarx = 0; aarx < nb_rx_ant; aarx++) {
+      const int stream = aarx + aatx * desc->nb_rx;
+      const struct complexd *channel = desc->ch[stream];
+      if (channel == NULL)
+        continue;
+      c16_t *dst_stream = &dst_slot[(aatx * nb_rx_ant + aarx) * stream_stride];
+      for (int symbol = start_symbol; symbol < end_symbol && symbol < frame_parms->symbols_per_slot; symbol++) {
+        c16_t *dst_symbol = &dst_stream[symbol * nb_re_pusch];
+        for (int k = 0; k < nb_re_pusch; k++) {
+          const double freq_hz = ((double)(start_sc + k) - (double)grid_sc / 2.0) * scs_hz;
+          const double theta_per_sample = two_pi * freq_hz / sample_rate_hz;
+          double h_re = 0.0;
+          double h_im = 0.0;
+          for (int tap = 0; tap < desc->channel_length; tap++) {
+            const double theta = theta_per_sample * (double)tap;
+            const double c = cos(theta);
+            const double s = sin(theta);
+            h_re += channel[tap].r * c + channel[tap].i * s;
+            h_im += channel[tap].i * c - channel[tap].r * s;
+          }
+          dst_symbol[k].r = clip_true_channel_sample(ce_unit_scale * h_re);
+          dst_symbol[k].i = clip_true_channel_sample(ce_unit_scale * h_im);
+        }
+      }
+    }
+  }
+}
 #endif
+
+#define OAI_AMMSE_CE_MAGIC 0x414d4d53u
+#define OAI_AMMSE_CE_VERSION 1u
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t header_bytes;
+  uint32_t request_id;
+  uint32_t frame;
+  uint32_t slot;
+  uint32_t rb_size;
+  uint32_t nr_symbols;
+  uint32_t start_symbol;
+  uint32_t nb_re;
+  uint32_t grid_elems;
+  uint32_t nr_layers;
+  uint32_t nb_rx_ant;
+  uint32_t nvar;
+  uint32_t width_ppm;
+  uint32_t depth_ppm;
+} oai_ammse_ce_request_header_t;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t header_bytes;
+  uint32_t request_id;
+  uint32_t status;
+  uint32_t grid_elems;
+  uint32_t model_us;
+  uint32_t reserved;
+} oai_ammse_ce_response_header_t;
+
+typedef struct {
+  bool init_done;
+  bool enabled;
+  bool warned_connect;
+  bool warned_unsupported;
+  bool warned_subnet_file;
+  int fd;
+  uint32_t request_id;
+  uint32_t width_ppm;
+  uint32_t depth_ppm;
+  uint64_t last_subnet_check_us;
+  uint64_t subnet_poll_us;
+  time_t subnet_file_mtime;
+  long subnet_file_mtime_nsec;
+  char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+  char subnet_file_path[512];
+  FILE *metrics_fp;
+} oai_ammse_ce_state_t;
+
+static oai_ammse_ce_state_t oai_ammse_ce_state = {.fd = -1};
+static bool oai_ammse_ce_applied_for_current_pusch = false;
+
+static uint32_t oai_ammse_ce_value_to_ppm(double value);
+static double oai_ammse_ce_ppm_to_value(uint32_t value_ppm);
+static bool oai_ammse_ce_parse_width_depth(const char *text, uint32_t *width_ppm, uint32_t *depth_ppm);
+static void oai_ammse_ce_load_subnet_from_file(oai_ammse_ce_state_t *state);
+
+#if T_TRACER
+#define OAI_CE_NMSE_QUEUE_DEPTH 4
+#define OAI_CE_NMSE_MAX_RE 3300
+#define OAI_CE_NMSE_MAX_SYMBOLS 14
+#define OAI_CE_NMSE_MAX_GRID_ELEMS (OAI_CE_NMSE_MAX_RE * OAI_CE_NMSE_MAX_SYMBOLS)
+#define OAI_CE_NMSE_MAX_TAPS 2048
+
+typedef struct {
+  bool valid;
+  uint32_t frame;
+  uint8_t slot;
+  int rb_size;
+  int nr_symbols;
+  int start_symbol;
+  int nb_re;
+  int grid_elems;
+  int start_sc;
+  int n_rb_ul;
+  int subcarrier_spacing;
+  int channel_length;
+  double sample_rate_hz;
+  double path_loss_linear;
+  char method_label[64];
+  bool has_oai_inter_grid;
+  c16_t applied_grid[OAI_CE_NMSE_MAX_GRID_ELEMS];
+  c16_t oai_inter_grid[OAI_CE_NMSE_MAX_GRID_ELEMS];
+  c16_t raw_dmrs_grid[OAI_CE_NMSE_MAX_GRID_ELEMS];
+  struct complexd taps[OAI_CE_NMSE_MAX_TAPS];
+} oai_ce_nmse_sample_t;
+
+typedef struct {
+  bool init_done;
+  bool enabled;
+  bool warned_unsupported;
+  bool warned_channel;
+  bool warned_thread;
+  unsigned int period;
+  unsigned int seen;
+  unsigned int dropped;
+  pthread_t thread;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  int head;
+  int tail;
+  int count;
+  FILE *csv_fp;
+  oai_ce_nmse_sample_t queue[OAI_CE_NMSE_QUEUE_DEPTH];
+} oai_ce_nmse_state_t;
+
+static oai_ce_nmse_state_t oai_ce_nmse_state = {
+    .period = 1,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+};
+#endif
+
+static uint64_t monotonic_time_us(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
+
+#if T_TRACER
+static bool env_flag_enabled(const char *name)
+{
+  const char *value = getenv(name);
+  if (value == NULL || value[0] == '\0')
+    return false;
+  return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0
+         && strcasecmp(value, "off") != 0;
+}
+
+static double ce_nmse_db(double err_power, double ref_power)
+{
+  if (ref_power <= 0.0 || err_power < 0.0)
+    return NAN;
+  return 10.0 * log10(err_power / ref_power);
+}
+
+static void ce_nmse_true_sample(const oai_ce_nmse_sample_t *sample, int k, double *true_re, double *true_im)
+{
+  const double scs_hz = 15000.0 * (double)(1U << sample->subcarrier_spacing);
+  const int grid_sc = sample->n_rb_ul * NR_NB_SC_PER_RB;
+  const double freq_hz = ((double)(sample->start_sc + k) - (double)grid_sc / 2.0) * scs_hz;
+  const double theta_per_sample = 6.28318530717958647692 * freq_hz / sample->sample_rate_hz;
+  double h_re = 0.0;
+  double h_im = 0.0;
+  for (int tap = 0; tap < sample->channel_length; tap++) {
+    const double theta = theta_per_sample * (double)tap;
+    const double c = cos(theta);
+    const double s = sin(theta);
+    h_re += sample->taps[tap].r * c + sample->taps[tap].i * s;
+    h_im += sample->taps[tap].i * c - sample->taps[tap].r * s;
+  }
+  const double ce_unit_scale = 364.0 * sample->path_loss_linear;
+  *true_re = (double)clip_true_channel_sample(ce_unit_scale * h_re);
+  *true_im = (double)clip_true_channel_sample(ce_unit_scale * h_im);
+}
+
+static void ce_nmse_compute(const oai_ce_nmse_sample_t *sample,
+                            double *applied_nmse_db,
+                            double *oai_inter_nmse_db,
+                            double *raw_dmrs_nmse_db,
+                            int *raw_support)
+{
+  double applied_err = 0.0;
+  double applied_ref = 0.0;
+  double oai_inter_err = 0.0;
+  double oai_inter_ref = 0.0;
+  double raw_err = 0.0;
+  double raw_ref = 0.0;
+  int raw_count = 0;
+  for (int rel_symbol = 0; rel_symbol < sample->nr_symbols; rel_symbol++) {
+    for (int k = 0; k < sample->nb_re; k++) {
+      double true_re = 0.0;
+      double true_im = 0.0;
+      ce_nmse_true_sample(sample, k, &true_re, &true_im);
+      const int idx = rel_symbol * sample->nb_re + k;
+      const c16_t applied = sample->applied_grid[idx];
+      const double applied_dr = (double)applied.r - true_re;
+      const double applied_di = (double)applied.i - true_im;
+      applied_err += applied_dr * applied_dr + applied_di * applied_di;
+      applied_ref += true_re * true_re + true_im * true_im;
+
+      if (sample->has_oai_inter_grid) {
+        const c16_t oai_inter = sample->oai_inter_grid[idx];
+        const double oai_inter_dr = (double)oai_inter.r - true_re;
+        const double oai_inter_di = (double)oai_inter.i - true_im;
+        oai_inter_err += oai_inter_dr * oai_inter_dr + oai_inter_di * oai_inter_di;
+        oai_inter_ref += true_re * true_re + true_im * true_im;
+      }
+
+      const c16_t raw = sample->raw_dmrs_grid[idx];
+      if (raw.r != 0 || raw.i != 0) {
+        const double raw_dr = (double)raw.r - true_re;
+        const double raw_di = (double)raw.i - true_im;
+        raw_err += raw_dr * raw_dr + raw_di * raw_di;
+        raw_ref += true_re * true_re + true_im * true_im;
+        raw_count++;
+      }
+    }
+  }
+  *applied_nmse_db = ce_nmse_db(applied_err, applied_ref);
+  *oai_inter_nmse_db = sample->has_oai_inter_grid ? ce_nmse_db(oai_inter_err, oai_inter_ref) : NAN;
+  *raw_dmrs_nmse_db = ce_nmse_db(raw_err, raw_ref);
+  *raw_support = raw_count;
+}
+
+static void *ce_nmse_thread_main(void *arg)
+{
+  oai_ce_nmse_state_t *state = (oai_ce_nmse_state_t *)arg;
+  while (true) {
+    oai_ce_nmse_sample_t sample;
+    memset(&sample, 0, sizeof(sample));
+    pthread_mutex_lock(&state->mutex);
+    while (state->count == 0)
+      pthread_cond_wait(&state->cond, &state->mutex);
+    sample = state->queue[state->tail];
+    state->tail = (state->tail + 1) % OAI_CE_NMSE_QUEUE_DEPTH;
+    state->count--;
+    const unsigned int dropped = __atomic_load_n(&state->dropped, __ATOMIC_RELAXED);
+    pthread_mutex_unlock(&state->mutex);
+
+    double applied_db = NAN;
+    double oai_inter_db = NAN;
+    double raw_db = NAN;
+    int raw_support = 0;
+    ce_nmse_compute(&sample, &applied_db, &oai_inter_db, &raw_db, &raw_support);
+    const bool is_ammse = strncmp(sample.method_label, "ammse", strlen("ammse")) == 0;
+    LOG_I(PHY,
+          "CE_NMSE frame=%u slot=%u method=%s %s=%.3f dB oai_inter_all_re=%.3f dB raw_dmrs=%.3f dB raw_re=%d "
+          "grid_re=%d dropped=%u\n",
+          sample.frame,
+          sample.slot,
+          sample.method_label,
+          is_ammse ? "ammse_all_re" : "oai_inter_all_re",
+          applied_db,
+          oai_inter_db,
+          raw_db,
+          raw_support,
+          sample.grid_elems,
+          dropped);
+    if (state->csv_fp != NULL) {
+      fprintf(state->csv_fp,
+              "%u,%u,%s,%.6f,%.6f,%.6f,%d,%d,%u\n",
+              sample.frame,
+              sample.slot,
+              sample.method_label,
+              applied_db,
+              oai_inter_db,
+              raw_db,
+              raw_support,
+              sample.grid_elems,
+              dropped);
+      fflush(state->csv_fp);
+    }
+  }
+  return NULL;
+}
+
+static void oai_ce_nmse_init(void)
+{
+  oai_ce_nmse_state_t *state = &oai_ce_nmse_state;
+  if (state->init_done)
+    return;
+  state->init_done = true;
+  state->enabled = env_flag_enabled("OAI_CE_NMSE_ENABLE") || env_flag_enabled("OAI_CE_NMSE");
+  if (!state->enabled)
+    return;
+
+  const char *period = getenv("OAI_CE_NMSE_PERIOD");
+  if (period != NULL && period[0] != '\0') {
+    unsigned long parsed = strtoul(period, NULL, 10);
+    state->period = parsed == 0 ? 1 : (unsigned int)parsed;
+  }
+
+  const char *csv_path = getenv("OAI_CE_NMSE_CSV");
+  if (csv_path != NULL && csv_path[0] != '\0') {
+    state->csv_fp = fopen(csv_path, "w");
+    if (state->csv_fp != NULL) {
+      fprintf(state->csv_fp,
+              "frame,slot,method,applied_all_re_nmse_db,oai_inter_all_re_nmse_db,raw_dmrs_nmse_db,raw_dmrs_re,grid_re,"
+              "dropped\n");
+      fflush(state->csv_fp);
+    } else {
+      LOG_W(PHY, "failed to open OAI_CE_NMSE_CSV=%s: %s\n", csv_path, strerror(errno));
+    }
+  }
+
+  int ret = pthread_create(&state->thread, NULL, ce_nmse_thread_main, state);
+  if (ret != 0) {
+    state->enabled = false;
+    if (!state->warned_thread) {
+      LOG_W(PHY, "failed to start CE NMSE logger thread: %s\n", strerror(ret));
+      state->warned_thread = true;
+    }
+    return;
+  }
+  pthread_detach(state->thread);
+  LOG_I(PHY, "online CE NMSE logger enabled, period=%u PUSCH event(s)\n", state->period);
+}
+
+bool oai_ce_nmse_enabled(void)
+{
+  oai_ce_nmse_init();
+  return oai_ce_nmse_state.enabled;
+}
+
+static void oai_ce_nmse_maybe_enqueue(PHY_VARS_gNB *gNB,
+                                      NR_gNB_PUSCH *pusch_vars,
+                                      uint32_t frame,
+                                      uint8_t slot,
+                                      const nfapi_nr_pusch_pdu_t *rel15_ul,
+                                      const c16_t *pusch_ch_est_dmrs_pos_slot_mem,
+                                      const c16_t *oai_inter_grid)
+{
+  if (!oai_ce_nmse_enabled())
+    return;
+
+  oai_ce_nmse_state_t *state = &oai_ce_nmse_state;
+  state->seen++;
+  if (((state->seen - 1) % state->period) != 0)
+    return;
+
+  NR_DL_FRAME_PARMS *frame_parms = &gNB->frame_parms;
+  const int nb_rx_ant = frame_parms->nb_antennas_rx;
+  const int nb_layer = rel15_ul->nrOfLayers;
+  const int nb_re = rel15_ul->rb_size * NR_NB_SC_PER_RB;
+  const int grid_elems = nb_re * rel15_ul->nr_of_symbols;
+  if (nb_rx_ant != 1 || nb_layer != 1 || rel15_ul->nr_of_symbols > OAI_CE_NMSE_MAX_SYMBOLS || nb_re > OAI_CE_NMSE_MAX_RE
+      || grid_elems > OAI_CE_NMSE_MAX_GRID_ELEMS) {
+    if (!state->warned_unsupported) {
+      LOG_W(PHY,
+            "CE NMSE logger supports 1 layer, 1 RX, <=%d RE/symbol, <=%d symbols; got layers=%d rx=%d re=%d symbols=%d\n",
+            OAI_CE_NMSE_MAX_RE,
+            OAI_CE_NMSE_MAX_SYMBOLS,
+            nb_layer,
+            nb_rx_ant,
+            nb_re,
+            rel15_ul->nr_of_symbols);
+      state->warned_unsupported = true;
+    }
+    return;
+  }
+
+  channel_desc_t *desc = get_rfsim_uplink_channel_desc();
+  if (desc == NULL || desc->ch == NULL || desc->channel_length <= 0 || desc->sampling_rate <= 0.0 || desc->nb_rx < 1
+      || desc->nb_tx < 1 || desc->ch[0] == NULL) {
+    if (!state->warned_channel) {
+      LOG_W(PHY, "CE NMSE logger has no RFsim true channel; strict NMSE cannot be computed\n");
+      state->warned_channel = true;
+    }
+    return;
+  }
+  if (desc->channel_length > OAI_CE_NMSE_MAX_TAPS) {
+    if (!state->warned_channel) {
+      LOG_W(PHY,
+            "CE NMSE logger channel_length=%d exceeds max=%d; strict NMSE disabled for this run\n",
+            desc->channel_length,
+            OAI_CE_NMSE_MAX_TAPS);
+      state->warned_channel = true;
+    }
+    return;
+  }
+
+  if (pthread_mutex_trylock(&state->mutex) != 0) {
+    __sync_fetch_and_add(&state->dropped, 1);
+    return;
+  }
+  if (state->count == OAI_CE_NMSE_QUEUE_DEPTH) {
+    __sync_fetch_and_add(&state->dropped, 1);
+    pthread_mutex_unlock(&state->mutex);
+    return;
+  }
+
+  oai_ce_nmse_sample_t *sample = &state->queue[state->head];
+  memset(sample, 0, sizeof(*sample));
+  sample->valid = true;
+  sample->frame = frame;
+  sample->slot = slot;
+  sample->rb_size = rel15_ul->rb_size;
+  sample->nr_symbols = rel15_ul->nr_of_symbols;
+  sample->start_symbol = rel15_ul->start_symbol_index;
+  sample->nb_re = nb_re;
+  sample->grid_elems = grid_elems;
+  sample->start_sc = (rel15_ul->bwp_start + rel15_ul->rb_start) * NR_NB_SC_PER_RB;
+  sample->n_rb_ul = frame_parms->N_RB_UL;
+  sample->subcarrier_spacing = rel15_ul->subcarrier_spacing;
+  sample->channel_length = desc->channel_length;
+  sample->sample_rate_hz = desc->sampling_rate * 1e6;
+  sample->path_loss_linear = pow(10.0, desc->path_loss_dB / 20.0);
+
+  const char *label = getenv("OAI_CE_NMSE_LABEL");
+  if ((label == NULL || label[0] == '\0') && oai_ammse_ce_applied_for_current_pusch)
+    label = getenv("OAI_AMMSE_CE_LABEL");
+  if (label == NULL || label[0] == '\0') {
+    if (oai_ammse_ce_applied_for_current_pusch) {
+      snprintf(sample->method_label,
+               sizeof(sample->method_label),
+               "ammse_w%.6g_d%.6g",
+               oai_ammse_ce_ppm_to_value(oai_ammse_ce_state.width_ppm),
+               oai_ammse_ce_ppm_to_value(oai_ammse_ce_state.depth_ppm));
+    } else {
+      snprintf(sample->method_label, sizeof(sample->method_label), "%s", "oai_interpolated");
+    }
+  } else {
+    snprintf(sample->method_label, sizeof(sample->method_label), "%s", label);
+  }
+
+  const c16_t *raw_src = &pusch_ch_est_dmrs_pos_slot_mem[rel15_ul->start_symbol_index * nb_re];
+  memcpy(sample->raw_dmrs_grid, raw_src, sizeof(c16_t) * grid_elems);
+  if (oai_inter_grid != NULL) {
+    sample->has_oai_inter_grid = true;
+    memcpy(sample->oai_inter_grid, oai_inter_grid, sizeof(c16_t) * grid_elems);
+  }
+
+  const c16_t *applied_stream = (const c16_t *)pusch_vars->ul_ch_estimates[0];
+  for (int rel_symbol = 0; rel_symbol < rel15_ul->nr_of_symbols; rel_symbol++) {
+    const int symbol = rel15_ul->start_symbol_index + rel_symbol;
+    const c16_t *src_symbol = &applied_stream[symbol * frame_parms->ofdm_symbol_size];
+    c16_t *dst_symbol = &sample->applied_grid[rel_symbol * nb_re];
+    memcpy(dst_symbol, src_symbol, sizeof(c16_t) * nb_re);
+  }
+  memcpy(sample->taps, desc->ch[0], sizeof(struct complexd) * desc->channel_length);
+
+  state->head = (state->head + 1) % OAI_CE_NMSE_QUEUE_DEPTH;
+  state->count++;
+  pthread_cond_signal(&state->cond);
+  pthread_mutex_unlock(&state->mutex);
+}
+#else
+bool oai_ce_nmse_enabled(void)
+{
+  return false;
+}
+#endif
+
+static uint32_t oai_ammse_ce_value_to_ppm(double value)
+{
+  if (!isfinite(value) || value <= 0.0)
+    return 0;
+  if (value > 4.0)
+    value = 4.0;
+  return (uint32_t)llround(value * 1000000.0);
+}
+
+static double oai_ammse_ce_ppm_to_value(uint32_t value_ppm)
+{
+  return (double)value_ppm / 1000000.0;
+}
+
+static bool oai_ammse_ce_parse_width_depth(const char *text, uint32_t *width_ppm, uint32_t *depth_ppm)
+{
+  double width = 0.0;
+  double depth = 0.0;
+  const char *width_pos = strstr(text, "width=");
+  const char *depth_pos = strstr(text, "depth=");
+  if (width_pos != NULL && depth_pos != NULL) {
+    width = strtod(width_pos + strlen("width="), NULL);
+    depth = strtod(depth_pos + strlen("depth="), NULL);
+  } else if (sscanf(text, "w=%lf d=%lf", &width, &depth) != 2 && sscanf(text, "%lf %lf", &width, &depth) != 2) {
+    return false;
+  }
+  const uint32_t parsed_width = oai_ammse_ce_value_to_ppm(width);
+  const uint32_t parsed_depth = oai_ammse_ce_value_to_ppm(depth);
+  if (parsed_width == 0 || parsed_depth == 0)
+    return false;
+  *width_ppm = parsed_width;
+  *depth_ppm = parsed_depth;
+  return true;
+}
+
+static void oai_ammse_ce_load_subnet_from_file(oai_ammse_ce_state_t *state)
+{
+  if (state->subnet_file_path[0] == '\0')
+    return;
+  const uint64_t now_us = monotonic_time_us();
+  if (state->last_subnet_check_us != 0 && now_us - state->last_subnet_check_us < state->subnet_poll_us)
+    return;
+  state->last_subnet_check_us = now_us;
+
+  struct stat st;
+  if (stat(state->subnet_file_path, &st) != 0)
+    return;
+  if (state->subnet_file_mtime == st.st_mtime && state->subnet_file_mtime_nsec == st.st_mtim.tv_nsec)
+    return;
+
+  FILE *fp = fopen(state->subnet_file_path, "r");
+  if (fp == NULL) {
+    if (!state->warned_subnet_file) {
+      LOG_W(PHY, "failed to open OAI_AMMSE_CE_SUBNET_FILE=%s: %s\n", state->subnet_file_path, strerror(errno));
+      state->warned_subnet_file = true;
+    }
+    return;
+  }
+  char line[128] = {0};
+  char *got = fgets(line, sizeof(line), fp);
+  fclose(fp);
+  if (got == NULL)
+    return;
+
+  uint32_t width_ppm = 0;
+  uint32_t depth_ppm = 0;
+  if (!oai_ammse_ce_parse_width_depth(line, &width_ppm, &depth_ppm)) {
+    if (!state->warned_subnet_file) {
+      LOG_W(PHY,
+            "failed to parse subnet file %s, expected 'width=0.25 depth=0.5' or '0.25 0.5'\n",
+            state->subnet_file_path);
+      state->warned_subnet_file = true;
+    }
+    return;
+  }
+  state->width_ppm = width_ppm;
+  state->depth_ppm = depth_ppm;
+  state->subnet_file_mtime = st.st_mtime;
+  state->subnet_file_mtime_nsec = st.st_mtim.tv_nsec;
+  state->warned_subnet_file = false;
+  LOG_I(PHY,
+        "A-MMSE CE subnet updated: width=%.6g depth=%.6g\n",
+        oai_ammse_ce_ppm_to_value(state->width_ppm),
+        oai_ammse_ce_ppm_to_value(state->depth_ppm));
+}
+
+static void oai_ammse_ce_init(void)
+{
+  oai_ammse_ce_state_t *state = &oai_ammse_ce_state;
+  if (state->init_done)
+    return;
+  state->init_done = true;
+  state->fd = -1;
+  const char *socket_path = getenv("OAI_AMMSE_CE_SOCKET");
+  if (socket_path == NULL || socket_path[0] == '\0')
+    return;
+  if (strlen(socket_path) >= sizeof(state->socket_path)) {
+    LOG_E(PHY, "OAI_AMMSE_CE_SOCKET path too long, disabling A-MMSE CE hook\n");
+    return;
+  }
+  snprintf(state->socket_path, sizeof(state->socket_path), "%s", socket_path);
+  state->enabled = true;
+  const char *width_env = getenv("OAI_AMMSE_CE_WIDTH");
+  const char *depth_env = getenv("OAI_AMMSE_CE_DEPTH");
+  state->width_ppm = oai_ammse_ce_value_to_ppm(width_env != NULL && width_env[0] != '\0' ? strtod(width_env, NULL) : 1.0);
+  state->depth_ppm = oai_ammse_ce_value_to_ppm(depth_env != NULL && depth_env[0] != '\0' ? strtod(depth_env, NULL) : 1.0);
+  if (state->width_ppm == 0)
+    state->width_ppm = 1000000;
+  if (state->depth_ppm == 0)
+    state->depth_ppm = 1000000;
+  state->subnet_poll_us = 100000;
+  const char *poll_env = getenv("OAI_AMMSE_CE_SUBNET_POLL_US");
+  if (poll_env != NULL && poll_env[0] != '\0') {
+    uint64_t parsed_poll = strtoull(poll_env, NULL, 10);
+    if (parsed_poll > 0)
+      state->subnet_poll_us = parsed_poll;
+  }
+  const char *subnet_file = getenv("OAI_AMMSE_CE_SUBNET_FILE");
+  if (subnet_file != NULL && subnet_file[0] != '\0') {
+    if (strlen(subnet_file) >= sizeof(state->subnet_file_path)) {
+      LOG_W(PHY, "OAI_AMMSE_CE_SUBNET_FILE path too long, ignoring dynamic subnet file\n");
+    } else {
+      snprintf(state->subnet_file_path, sizeof(state->subnet_file_path), "%s", subnet_file);
+      oai_ammse_ce_load_subnet_from_file(state);
+    }
+  }
+  const char *metrics_path = getenv("OAI_AMMSE_CE_METRICS");
+  if (metrics_path != NULL && metrics_path[0] != '\0') {
+    state->metrics_fp = fopen(metrics_path, "w");
+    if (state->metrics_fp != NULL) {
+      fprintf(state->metrics_fp,
+              "request_id,frame,slot,rb_size,nr_symbols,grid_elems,width,depth,status,wall_us,model_us,max_ch\n");
+      fflush(state->metrics_fp);
+    } else {
+      LOG_W(PHY, "failed to open OAI_AMMSE_CE_METRICS=%s: %s\n", metrics_path, strerror(errno));
+    }
+  }
+  LOG_I(PHY,
+        "A-MMSE CE hook enabled via Unix socket %s, width=%.6g depth=%.6g\n",
+        state->socket_path,
+        oai_ammse_ce_ppm_to_value(state->width_ppm),
+        oai_ammse_ce_ppm_to_value(state->depth_ppm));
+}
+
+bool oai_ammse_ce_enabled(void)
+{
+  oai_ammse_ce_init();
+  return oai_ammse_ce_state.enabled;
+}
+
+static bool oai_ammse_ce_connect(void)
+{
+  oai_ammse_ce_state_t *state = &oai_ammse_ce_state;
+  if (!oai_ammse_ce_enabled())
+    return false;
+  if (state->fd >= 0)
+    return true;
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0)
+    return false;
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  size_t socket_path_len = strnlen(state->socket_path, sizeof(addr.sun_path) - 1);
+  memcpy(addr.sun_path, state->socket_path, socket_path_len);
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (!state->warned_connect) {
+      LOG_W(PHY, "failed to connect A-MMSE CE server at %s: %s\n", state->socket_path, strerror(errno));
+      state->warned_connect = true;
+    }
+    close(fd);
+    return false;
+  }
+  state->fd = fd;
+  state->warned_connect = false;
+  return true;
+}
+
+static bool send_all(int fd, const void *data, size_t bytes)
+{
+  const uint8_t *ptr = (const uint8_t *)data;
+  while (bytes > 0) {
+    ssize_t sent = send(fd, ptr, bytes, MSG_NOSIGNAL);
+    if (sent < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    if (sent == 0)
+      return false;
+    ptr += sent;
+    bytes -= (size_t)sent;
+  }
+  return true;
+}
+
+static bool recv_all(int fd, void *data, size_t bytes)
+{
+  uint8_t *ptr = (uint8_t *)data;
+  while (bytes > 0) {
+    ssize_t got = recv(fd, ptr, bytes, MSG_WAITALL);
+    if (got < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    if (got == 0)
+      return false;
+    ptr += got;
+    bytes -= (size_t)got;
+  }
+  return true;
+}
+
+static void oai_ammse_ce_close_socket(void)
+{
+  if (oai_ammse_ce_state.fd >= 0) {
+    close(oai_ammse_ce_state.fd);
+    oai_ammse_ce_state.fd = -1;
+  }
+}
+
+static void apply_ammse_ce_grid(NR_gNB_PUSCH *pusch_vars,
+                                const NR_DL_FRAME_PARMS *frame_parms,
+                                const nfapi_nr_pusch_pdu_t *rel15_ul,
+                                const c16_t *grid,
+                                int *max_ch)
+{
+  const int nb_re = rel15_ul->rb_size * NR_NB_SC_PER_RB;
+  c16_t *ul_ch = (c16_t *)pusch_vars->ul_ch_estimates[0];
+  *max_ch = 0;
+  for (int rel_symbol = 0; rel_symbol < rel15_ul->nr_of_symbols; rel_symbol++) {
+    const int symbol = rel15_ul->start_symbol_index + rel_symbol;
+    c16_t *dst_symbol = &ul_ch[symbol * frame_parms->ofdm_symbol_size];
+    const c16_t *src_symbol = &grid[rel_symbol * nb_re];
+    for (int k = 0; k < nb_re; k++) {
+      dst_symbol[k] = src_symbol[k];
+      int re_abs = abs(src_symbol[k].r);
+      int im_abs = abs(src_symbol[k].i);
+      if (re_abs > *max_ch)
+        *max_ch = re_abs;
+      if (im_abs > *max_ch)
+        *max_ch = im_abs;
+    }
+  }
+}
+
+static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
+                                     NR_gNB_PUSCH *pusch_vars,
+                                     uint32_t frame,
+                                     uint8_t slot,
+                                     const nfapi_nr_pusch_pdu_t *rel15_ul,
+                                     uint32_t nvar,
+                                     c16_t *pusch_ch_est_dmrs_pos_slot_mem,
+                                     int *max_ch)
+{
+  oai_ammse_ce_applied_for_current_pusch = false;
+  if (!oai_ammse_ce_enabled())
+    return false;
+  NR_DL_FRAME_PARMS *frame_parms = &gNB->frame_parms;
+  const int nb_rx_ant = frame_parms->nb_antennas_rx;
+  const int nb_layer = rel15_ul->nrOfLayers;
+  const int nb_re = rel15_ul->rb_size * NR_NB_SC_PER_RB;
+  const int grid_elems = nb_re * rel15_ul->nr_of_symbols;
+  if (nb_layer != 1 || nb_rx_ant != 1 || rel15_ul->rb_size != 50 || rel15_ul->nr_of_symbols != 13
+      || rel15_ul->start_symbol_index != 0) {
+    if (!oai_ammse_ce_state.warned_unsupported) {
+      LOG_W(PHY,
+            "A-MMSE CE hook supports only 1 layer, 1 RX, 50 RB, start_symbol=0, nr_symbols=13; got layers=%d rx=%d rb=%d "
+            "start=%d symbols=%d. Falling back to OAI CE.\n",
+            nb_layer,
+            nb_rx_ant,
+            rel15_ul->rb_size,
+            rel15_ul->start_symbol_index,
+            rel15_ul->nr_of_symbols);
+      oai_ammse_ce_state.warned_unsupported = true;
+    }
+    return false;
+  }
+  if (!oai_ammse_ce_connect())
+    return false;
+
+  c16_t response_grid[grid_elems] __attribute__((aligned(64)));
+  oai_ammse_ce_state_t *state = &oai_ammse_ce_state;
+  oai_ammse_ce_load_subnet_from_file(state);
+  oai_ammse_ce_request_header_t req = {
+      .magic = OAI_AMMSE_CE_MAGIC,
+      .version = OAI_AMMSE_CE_VERSION,
+      .header_bytes = sizeof(oai_ammse_ce_request_header_t),
+      .request_id = ++state->request_id,
+      .frame = frame,
+      .slot = slot,
+      .rb_size = rel15_ul->rb_size,
+      .nr_symbols = rel15_ul->nr_of_symbols,
+      .start_symbol = rel15_ul->start_symbol_index,
+      .nb_re = nb_re,
+      .grid_elems = grid_elems,
+      .nr_layers = nb_layer,
+      .nb_rx_ant = nb_rx_ant,
+      .nvar = nvar,
+      .width_ppm = state->width_ppm,
+      .depth_ppm = state->depth_ppm,
+  };
+
+  const uint64_t t0 = monotonic_time_us();
+  const c16_t *raw_grid = &pusch_ch_est_dmrs_pos_slot_mem[rel15_ul->start_symbol_index * nb_re];
+  bool ok = send_all(state->fd, &req, sizeof(req)) && send_all(state->fd, raw_grid, sizeof(c16_t) * grid_elems);
+  oai_ammse_ce_response_header_t resp;
+  memset(&resp, 0, sizeof(resp));
+  if (ok)
+    ok = recv_all(state->fd, &resp, sizeof(resp));
+  if (ok) {
+    ok = resp.magic == OAI_AMMSE_CE_MAGIC && resp.version == OAI_AMMSE_CE_VERSION && resp.request_id == req.request_id
+         && resp.status == 0 && resp.grid_elems == (uint32_t)grid_elems;
+  }
+  if (ok)
+    ok = recv_all(state->fd, response_grid, sizeof(c16_t) * grid_elems);
+  const uint64_t t1 = monotonic_time_us();
+  if (!ok) {
+    LOG_W(PHY, "A-MMSE CE server request failed; falling back to OAI CE\n");
+    oai_ammse_ce_close_socket();
+    if (state->metrics_fp != NULL) {
+      fprintf(state->metrics_fp,
+              "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%d,%llu,%u,%d\n",
+              req.request_id,
+              frame,
+              slot,
+              req.rb_size,
+              req.nr_symbols,
+              req.grid_elems,
+              oai_ammse_ce_ppm_to_value(req.width_ppm),
+              oai_ammse_ce_ppm_to_value(req.depth_ppm),
+              -1,
+              (unsigned long long)(t1 - t0),
+              resp.model_us,
+              *max_ch);
+      fflush(state->metrics_fp);
+    }
+    return false;
+  }
+
+  apply_ammse_ce_grid(pusch_vars, frame_parms, rel15_ul, response_grid, max_ch);
+  oai_ammse_ce_applied_for_current_pusch = true;
+  if (state->metrics_fp != NULL) {
+    fprintf(state->metrics_fp,
+            "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%u,%llu,%u,%d\n",
+            req.request_id,
+            frame,
+            slot,
+            req.rb_size,
+            req.nr_symbols,
+            req.grid_elems,
+            oai_ammse_ce_ppm_to_value(req.width_ppm),
+            oai_ammse_ce_ppm_to_value(req.depth_ppm),
+            resp.status,
+            (unsigned long long)(t1 - t0),
+            resp.model_us,
+            *max_ch);
+    fflush(state->metrics_fp);
+  }
+  return true;
+}
 
 void nr_idft(int32_t *z, uint32_t Msc_PUSCH)
 {
@@ -887,6 +1780,8 @@ static void inner_rx(PHY_VARS_gNB *gNB,
     int end_symbol = rel15_ul->start_symbol_index + rel15_ul->nr_of_symbols;
     dmrs_symbol = get_next_dmrs_symbol_in_slot(rel15_ul->ul_dmrs_symb_pos, rel15_ul->start_symbol_index, end_symbol);
   }
+  if (oai_ammse_ce_applied_for_current_pusch)
+    dmrs_symbol = symbol;
 
   for (int aarx = 0; aarx < nb_rx_ant; aarx++) {
     for (int aatx = 0; aatx < nb_layer; aatx++) {
@@ -1130,6 +2025,7 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
                    uint8_t slot,
                    int beam_nb)
 {
+  oai_ammse_ce_applied_for_current_pusch = false;
   NR_DL_FRAME_PARMS *frame_parms = &gNB->frame_parms;
 
   uint32_t bwp_start_subcarrier = ((rel15_ul->rb_start + rel15_ul->bwp_start) * NR_NB_SC_PER_RB + frame_parms->first_carrier_offset) % frame_parms->ofdm_symbol_size;
@@ -1150,6 +2046,13 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
   c16_t pusch_ch_est_dmrs_interpl_slot_mem[buffer_length_slot * 1 * 1] __attribute__((aligned(64)));
   // memory to store extracted data including PUSCH + DMRS
   c16_t rxFext_slot_mem[1 * buffer_length_slot] __attribute__((aligned(64)));
+#if T_TRACER
+  // memory to store the RFsim true channel over the scheduled PUSCH grid
+  c16_t rfsim_true_channel_slot_mem[buffer_length_slot * rel15_ul->nrOfLayers * frame_parms->nb_antennas_rx]
+      __attribute__((aligned(64)));
+  // memory to store the OAI interpolated CE grid before optional A-MMSE replacement
+  c16_t oai_inter_ch_est_slot_mem[buffer_length_slot] __attribute__((aligned(64)));
+#endif
 
 #if T_TRACER
   // Initialize memory for DMRS signals
@@ -1167,7 +2070,13 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
   // memory to store extracted data including PUSCH + DMRS
   if (T_ACTIVE(T_GNB_PHY_UL_FD_PUSCH_IQ))
     memset(rxFext_slot_mem, 0, sizeof(c16_t) * buffer_length_slot * 1 * 1);
+
+  // memory to store RFsim true channel coefficients
+  if (T_ACTIVE(T_GNB_PHY_UL_FD_TRUE_CHANNEL))
+    memset(rfsim_true_channel_slot_mem, 0, sizeof(rfsim_true_channel_slot_mem));
 #endif
+  if (oai_ammse_ce_enabled() || oai_ce_nmse_enabled())
+    memset(pusch_ch_est_dmrs_pos_slot_mem, 0, sizeof(c16_t) * buffer_length_slot * 1 * 1);
 
   //----------------------------------------------------------
   //------------------- Channel estimation -------------------
@@ -1260,6 +2169,34 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
                              rel15_ul->rb_size,
                              rel15_ul->nrOfLayers);
 
+#if T_TRACER
+  c16_t *oai_inter_grid_for_nmse = NULL;
+  if (oai_ce_nmse_enabled() && rel15_ul->nrOfLayers == 1 && frame_parms->nb_antennas_rx == 1) {
+    const int nb_re_for_nmse = rel15_ul->rb_size * NR_NB_SC_PER_RB;
+    const c16_t *oai_inter_stream = (const c16_t *)pusch_vars->ul_ch_estimates[0];
+    for (int rel_symbol = 0; rel_symbol < rel15_ul->nr_of_symbols; rel_symbol++) {
+      const int symbol = rel15_ul->start_symbol_index + rel_symbol;
+      int dmrs_symbol = 0;
+      if (gNB->chest_time == 0) {
+        const int dmrs_symbol_flag = (rel15_ul->ul_dmrs_symb_pos >> symbol) & 0x01;
+        dmrs_symbol = dmrs_symbol_flag ? symbol : get_valid_dmrs_idx_for_channel_est(rel15_ul->ul_dmrs_symb_pos, symbol);
+      } else {
+        dmrs_symbol = get_next_dmrs_symbol_in_slot(rel15_ul->ul_dmrs_symb_pos, rel15_ul->start_symbol_index, end_symbol);
+      }
+      const c16_t *src_symbol = &oai_inter_stream[dmrs_symbol * frame_parms->ofdm_symbol_size];
+      c16_t *dst_symbol = &oai_inter_ch_est_slot_mem[rel_symbol * nb_re_for_nmse];
+      memcpy(dst_symbol, src_symbol, sizeof(c16_t) * nb_re_for_nmse);
+    }
+    oai_inter_grid_for_nmse = oai_inter_ch_est_slot_mem;
+  }
+#endif
+
+  oai_ammse_ce_try_replace(gNB, pusch_vars, frame, slot, rel15_ul, nvar, pusch_ch_est_dmrs_pos_slot_mem, &max_ch);
+
+#if T_TRACER
+  oai_ce_nmse_maybe_enqueue(gNB, pusch_vars, frame, slot, rel15_ul, pusch_ch_est_dmrs_pos_slot_mem, oai_inter_grid_for_nmse);
+#endif
+
   stop_meas(&gNB->ulsch_channel_estimation_stats);
 
   start_meas(&gNB->rx_pusch_init_stats);
@@ -1324,6 +2261,8 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
     dmrs_symbol = get_valid_dmrs_idx_for_channel_est(rel15_ul->ul_dmrs_symb_pos, meas_symbol);
   else // average of channel estimates stored in first symbol
     dmrs_symbol = get_next_dmrs_symbol_in_slot(rel15_ul->ul_dmrs_symb_pos, rel15_ul->start_symbol_index, end_symbol);
+  if (oai_ammse_ce_applied_for_current_pusch)
+    dmrs_symbol = meas_symbol;
   int size_est = nb_re_pusch * frame_parms->symbols_per_slot;
   __attribute__((aligned(64))) int ul_ch_estimates_ext[rel15_ul->nrOfLayers * frame_parms->nb_antennas_rx][size_est];
   memset(ul_ch_estimates_ext, 0, sizeof(ul_ch_estimates_ext));
@@ -1464,6 +2403,15 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
                                   (const c16_t *)pusch_ch_est_dmrs_interpl_slot_mem,
                                   rel15_ul->rb_size * NR_NB_SC_PER_RB * rel15_ul->nr_of_symbols
                                       * frame_parms->nb_antennas_rx * rel15_ul->nrOfLayers * 4);
+
+  if (T_ACTIVE(T_GNB_PHY_UL_FD_TRUE_CHANNEL)) {
+    fill_rfsim_true_channel_slot(rfsim_true_channel_slot_mem, rel15_ul->rb_size * NR_NB_SC_PER_RB, frame_parms, rel15_ul);
+    log_ul_fd_true_channel(frame, slot, frame_parms, rel15_ul,
+                           number_dmrs_symbols, dmrs_port,
+                           (const c16_t *)rfsim_true_channel_slot_mem,
+                           rel15_ul->rb_size * NR_NB_SC_PER_RB * rel15_ul->nr_of_symbols
+                               * frame_parms->nb_antennas_rx * rel15_ul->nrOfLayers * 4);
+  }
 #endif
 
   join_task_ans(&ans);

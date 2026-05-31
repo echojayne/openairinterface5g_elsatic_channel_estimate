@@ -131,6 +131,10 @@ ID = GNB_PHY_UL_FD_CHAN_EST_DMRS_INTERPL
     DESC = gNodeB channel estimation in the frequency domain based on DMRS and interploation.
     GROUP = ALL:PHY:GRAPHIC:HEAVY:GNB
     FORMAT = int,frame : int,slot : int,frame_type : int,freq_range : int,subcarrier_spacing : int,cyclic_prefix : int,symbols_per_slot : int,Nid_cell : int,rnti : int,rb_size : int,rb_start : int,start_symbol_index : int,nr_of_symbols : int,qam_mod_order : int,mcs_index : int,mcs_table : int,nrOfLayers : int,transform_precoding : int,dmrs_config_type : int,ul_dmrs_symb_pos : int,number_dmrs_symbols : int,dmrs_port : int,dmrs_nscid : int,nb_antennas_rx : int,number_of_bits : buffer,dataI
+ID = GNB_PHY_UL_FD_TRUE_CHANNEL
+    DESC = gNodeB RFsim true uplink channel response in the frequency domain.
+    GROUP = ALL:PHY:GRAPHIC:HEAVY:GNB
+    FORMAT = int,frame : int,slot : int,frame_type : int,freq_range : int,subcarrier_spacing : int,cyclic_prefix : int,symbols_per_slot : int,Nid_cell : int,rnti : int,rb_size : int,rb_start : int,start_symbol_index : int,nr_of_symbols : int,qam_mod_order : int,mcs_index : int,mcs_table : int,nrOfLayers : int,transform_precoding : int,dmrs_config_type : int,ul_dmrs_symb_pos : int,number_dmrs_symbols : int,dmrs_port : int,dmrs_nscid : int,nb_antennas_rx : int,number_of_bits : buffer,data
 ID = GNB_PHY_UL_PAYLOAD_RX_BITS
     DESC = gNodeB slot payload after decoder
     GROUP = ALL:PHY:GRAPHIC:HEAVY:GNB
@@ -3801,4 +3805,3 @@ ID = VCD_FUNCTION_BEAM_SWITCHING_GPIO
     GROUP = ALL:VCD:ENB:VCD_FUNCTION
     FORMAT = int,value
     VCD_NAME = beam_switching_gpio
-

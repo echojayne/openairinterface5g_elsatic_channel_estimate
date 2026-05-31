@@ -1151,7 +1151,6 @@ channel_desc_t *new_channel_desc_scm(uint8_t nb_tx,
       channel_length = (int)11+2*sampling_rate*Td;
       ricean_factor = 1;
       aoa = .03;
-      maxDoppler = 0;
       fill_channel_desc(chan_desc,
                         nb_tx,
                         nb_rx,
@@ -1178,7 +1177,6 @@ channel_desc_t *new_channel_desc_scm(uint8_t nb_tx,
       channel_length = (int)11+2*sampling_rate*Td;
       ricean_factor = 0.1;
       aoa = 0.7854;
-      maxDoppler = 0;
       fill_channel_desc(chan_desc,nb_tx,
                         nb_rx,
                         nb_taps,
@@ -1204,7 +1202,6 @@ channel_desc_t *new_channel_desc_scm(uint8_t nb_tx,
       channel_length = 1;
       ricean_factor = 0.0;
       aoa = .03;
-      maxDoppler = 0;
       fill_channel_desc(chan_desc,nb_tx,
                         nb_rx,
                         nb_taps,
@@ -1324,7 +1321,6 @@ channel_desc_t *new_channel_desc_scm(uint8_t nb_tx,
       channel_length = 1;
       ricean_factor = 0.1;
       aoa = 0.7854;
-      maxDoppler = 0;
       fill_channel_desc(chan_desc,nb_tx,
                         nb_rx,
                         nb_taps,
@@ -2290,6 +2286,7 @@ int load_channellist(uint8_t nb_tx, uint8_t nb_rx, double sampling_rate, uint64_
   int pindex_CO = config_paramidx_fromname(achannel_params,numparams, CHANNELMOD_MODEL_CO_PNAME );
   int pindex_PL = config_paramidx_fromname(achannel_params,numparams, CHANNELMOD_MODEL_PL_PNAME );
   int pindex_NP = config_paramidx_fromname(achannel_params,numparams, CHANNELMOD_MODEL_NP_PNAME );
+  int pindex_MD = config_paramidx_fromname(achannel_params,numparams, CHANNELMOD_MODEL_MD_PNAME );
   int pindex_TYPE = config_paramidx_fromname(achannel_params,numparams, CHANNELMOD_MODEL_TYPE_PNAME);
 
   for (int i=0; i<channel_list.numelt; i++) {
@@ -2312,7 +2309,7 @@ int load_channellist(uint8_t nb_tx, uint8_t nb_rx, double sampling_rate, uint64_
                                                          center_freq,
                                                          channel_bandwidth,
                                                          *(channel_list.paramarray[i][pindex_DT].dblptr),
-                                                         0.0,
+                                                         *(channel_list.paramarray[i][pindex_MD].dblptr),
                                                          CORR_LEVEL_LOW,
                                                          *(channel_list.paramarray[i][pindex_FF].dblptr),
                                                          *(channel_list.paramarray[i][pindex_CO].iptr),

@@ -286,6 +286,7 @@ typedef enum {
 #define CHANNELMOD_MODEL_FF_PNAME "forgetfact"
 #define CHANNELMOD_MODEL_CO_PNAME "offset"
 #define CHANNELMOD_MODEL_DT_PNAME "ds_tdl"
+#define CHANNELMOD_MODEL_MD_PNAME "max_Doppler"
 
 // clang-format off
 #define CHANNELMOD_MODEL_PARAMS_DESC {  \
@@ -296,6 +297,7 @@ typedef enum {
     {CHANNELMOD_MODEL_FF_PNAME,   "channel forget factor ((0 to 1)\n", 0,  .dblptr=NULL,             .defdblval=0,                     TYPE_DOUBLE,    0 }, \
     {CHANNELMOD_MODEL_CO_PNAME,   "channel offset in samps\n",         0,  .iptr=NULL,               .defintval=0,                     TYPE_INT,       0 }, \
     {CHANNELMOD_MODEL_DT_PNAME,   "delay spread for TDL models\n",     0,  .dblptr=NULL,             .defdblval=0,                     TYPE_DOUBLE,    0 }, \
+    {CHANNELMOD_MODEL_MD_PNAME,   "maximum Doppler in Hz\n",           0,  .dblptr=NULL,             .defdblval=0,                     TYPE_DOUBLE,    0 }, \
 }
 // clang-format on
 

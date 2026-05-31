@@ -39,8 +39,8 @@ global_info = {
 
 # Supported OAI Trace messages
 # UL receiver messages
-# gNB IQ Msgs: "GNB_PHY_UL_FD_PUSCH_IQ", "GNB_PHY_UL_FD_DMRS", "GNB_PHY_UL_FD_CHAN_EST_DMRS_POS", 
-#               "GNB_PHY_UL_FD_CHAN_EST_DMRS_INTERPL"
+# gNB IQ Msgs: "GNB_PHY_UL_FD_PUSCH_IQ", "GNB_PHY_UL_FD_DMRS", "GNB_PHY_UL_FD_CHAN_EST_DMRS_POS",
+#               "GNB_PHY_UL_FD_CHAN_EST_DMRS_INTERPL", "GNB_PHY_UL_FD_TRUE_CHANNEL"
 # gNB BITS Msgs: "GNB_PHY_UL_PAYLOAD_RX_BITS"
 # UE BITS Msgs: "UE_PHY_UL_SCRAMBLED_TX_BITS", "UE_PHY_UL_PAYLOAD_TX_BITS"
 
@@ -68,6 +68,12 @@ supported_oai_tracer_messages = {
         "file_name_prefix": "raw-inter-ce-fd-data",
         "scope": "gNB",
         "description": "Interpolcated Frequency-domain raw channel estimates",
+        "serialization_scheme": ["subcarriers", "ofdm_symbols"],
+    },
+    "GNB_PHY_UL_FD_TRUE_CHANNEL": {
+        "file_name_prefix": "true-channel-fd-data",
+        "scope": "gNB",
+        "description": "RFsim true uplink channel response in the frequency domain",
         "serialization_scheme": ["subcarriers", "ofdm_symbols"],
     },
     "GNB_PHY_UL_PAYLOAD_RX_BITS": {

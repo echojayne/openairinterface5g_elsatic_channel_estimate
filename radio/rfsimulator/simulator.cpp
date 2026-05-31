@@ -158,6 +158,7 @@ typedef struct buffer_s {
   char *transferPtr;
   uint64_t remainToTransfer;
   channel_desc_t *channel_model;
+  openair0_timestamp_t lastChannelUpdateTS;
   rfsim_packet_t *packet_ptr;
   size_t payload_sz;
   size_t remainToTransferBeam;
@@ -327,6 +328,7 @@ static buffer_t *allocCirBuf(rfsimulator_state_t *bridge, int sock)
   ptr->trashingPacket = true;
   ptr->transferPtr = (char *)&ptr->th;
   ptr->remainToTransfer = sizeof(samplesBlockHeader_t);
+  ptr->lastChannelUpdateTS = 0;
   ptr->received_packets = std::queue<rfsim_packet_t *>();
   int sendbuff = SEND_BUFF_SIZE;
   if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &sendbuff, sizeof(sendbuff)) != 0) {
@@ -549,6 +551,9 @@ static void rfsimulator_readconfig(rfsimulator_state_t *rfsimulator)
   uint64_t beam_map = *(gpd(rfsimuParam, sizeofArray(rfsimuParams), RFSIMU_BEAM_MAP)->u64ptr);
 
   rfsimulator->saveIQfile = -1;
+  // Channel descriptors can draw random taps while parsing channelmod config.
+  randominit();
+  set_taus_seed(0);
 
   int p = config_paramidx_fromname(rfsimuParams, sizeofArray(rfsimuParams), RFSIMU_OPTIONS_PARAMNAME);
   for (int i = 0; i < rfsimuParam[p].numelt; i++) {
@@ -1300,6 +1305,16 @@ static void rfsimulator_read_internal(rfsimulator_state_t *t,
         random_channel(ptr->channel_model, 0);
 
       if (ptr->channel_model != NULL) { // apply a channel model
+        if (ptr->channel_model->max_Doppler > 0.0) {
+          const double coherence_time_s = 0.423 / ptr->channel_model->max_Doppler;
+          uint64_t update_interval_samples = (uint64_t)(coherence_time_s * t->sample_rate + 0.5);
+          update_interval_samples = std::max<uint64_t>(update_interval_samples, std::max(1, nsamps));
+          const uint64_t elapsed = timestamp > ptr->lastChannelUpdateTS ? timestamp - ptr->lastChannelUpdateTS : 0;
+          if (ptr->lastChannelUpdateTS == 0 || elapsed >= update_interval_samples) {
+            random_channel(ptr->channel_model, 0);
+            ptr->lastChannelUpdateTS = timestamp;
+          }
+        }
         if (!channel_modelling) {
           memset(temp_array, 0, sizeof(temp_array));
           channel_modelling = true;
@@ -1639,9 +1654,6 @@ extern "C" __attribute__((__visibility__("default"))) int device_init(openair0_d
   rfsimulator->next_buf = 0;
 
   AssertFatal((rfsimulator->epollfd = epoll_create1(0)) != -1, "epoll_create1() failed, errno(%d)", errno);
-  // we need to call randominit() for telnet server (use gaussdouble=>uniformrand)
-  randominit();
-  set_taus_seed(0);
   /* look for telnet server, if it is loaded, add the channel modeling commands to it */
   add_telnetcmd_func_t addcmd = (add_telnetcmd_func_t)get_shlibmodule_fptr("telnetsrv", TELNET_ADDCMD_FNAME);
 

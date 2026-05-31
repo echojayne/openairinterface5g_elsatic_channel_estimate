@@ -4,6 +4,7 @@
 
 #include "nr_common.h"
 #include <string.h>
+#include <stdbool.h>
 
 #include "nr_ul_estimation.h"
 #include "PHY/sse_intrin.h"
@@ -17,6 +18,9 @@
 #include "executables/softmodem-common.h"
 #include "nr_phy_common.h"
 #include "openair1/PHY/TOOLS/phy_scope_interface.h"
+
+extern bool oai_ammse_ce_enabled(void);
+extern bool oai_ce_nmse_enabled(void);
 
 //#define DEBUG_CH
 //#define DEBUG_PUSCH
@@ -133,9 +137,7 @@ static void nr_pusch_antenna_processing(void *arg)
       int re_offset = k0;
       LOG_D(PHY, "PUSCH estimation DMRS type 1, Freq-domain interpolation");
       int pilot_cnt = 0;
-#if T_TRACER
       int ch_est_cnt = 0; // To trace channel coefficients
-#endif
 
       for (int n = 0; n < 3 * nb_rb_pusch; n++) {
         // LS estimation
@@ -153,8 +155,11 @@ static void nr_pusch_antenna_processing(void *arg)
           ul_ls_est[k] = ch16;
         }
 //------------------Write channel parameters to Memory  for data recording ------------------//
+        int store_dmrs_pos = nl == 0 && (oai_ammse_ce_enabled() || oai_ce_nmse_enabled());
 #if T_TRACER
-        if (T_ACTIVE(T_GNB_PHY_UL_FD_CHAN_EST_DMRS_POS) && nl == 0) {
+        store_dmrs_pos = store_dmrs_pos || (T_ACTIVE(T_GNB_PHY_UL_FD_CHAN_EST_DMRS_POS) && nl == 0);
+#endif
+        if (store_dmrs_pos) {
           // Trace channel coefficients
           c16_t *pusch_ch_est_dmrs_pos_slot_mem = rdata->pusch_ch_est_dmrs_pos_slot_mem;
           int dmrs_symbol_start_idx = rdata->dmrs_symbol_start_idx;
@@ -162,7 +167,6 @@ static void nr_pusch_antenna_processing(void *arg)
           pusch_ch_est_dmrs_pos_slot_mem[dmrs_symbol_start_idx + delta + ch_est_cnt + 2] = ch16; // 0, 2, 4, 6, 8, location of REs
         }
         ch_est_cnt += 4;
-#endif
         pilot_cnt += 2;
       }
       c16_t ch_estimates_time[frame_parms->ofdm_symbol_size] __attribute__((aligned(32)));
