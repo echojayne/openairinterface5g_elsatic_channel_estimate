@@ -118,7 +118,7 @@ sudo -E env \
     --phy-test \
     --noS1 \
     -O ci-scripts/conf_files/gnb.band78.106prb.rfsim.phytest-strujepa.conf \
-    --rfsimulator.[0].serveraddr server \
+    '--rfsimulator.[0].serveraddr' server \
     --T_stdout 2 \
     --T_nowait
 ```
@@ -140,11 +140,15 @@ sudo -E cmake_targets/ran_build_local/build/nr-uesoftmodem \
   --numerology 1 \
   --band 78 \
   -C 3619200000 \
-  --rfsimulator.[0].serveraddr 127.0.0.1 \
+  '--rfsimulator.[0].serveraddr' 127.0.0.1 \
   --T_stdout 2 \
   --T_nowait \
   --T_port 2023
 ```
+
+The `--rfsimulator.[0].serveraddr` option is quoted because `zsh` treats
+unquoted square brackets as filename glob syntax and fails with
+`zsh: no matches found`.
 
 If your PHY-test workflow uses pre-generated RRC files, add:
 
