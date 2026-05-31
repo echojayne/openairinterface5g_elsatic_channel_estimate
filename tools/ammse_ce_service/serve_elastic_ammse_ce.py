@@ -10,11 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import socket
 import struct
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -29,28 +27,10 @@ import torch
 from torch import nn
 
 SERVICE_DIR = Path(__file__).resolve().parent
-DEFAULT_STRUJEPA_ROOT = Path(os.environ.get("STRUJEPA_ROOT", "/home/users/dky/StruJEPA")).expanduser().resolve()
-STRUJEPA_ROOT = DEFAULT_STRUJEPA_ROOT
-STRUJEPA_SCRIPTS = STRUJEPA_ROOT / "scripts"
-for path in (SERVICE_DIR, STRUJEPA_SCRIPTS, STRUJEPA_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
 
-BENCHMARK_SOURCE_ROOT = Path("/mnt/dky/ai_ran_benchmarks/source_snapshots")
-if BENCHMARK_SOURCE_ROOT.exists() and str(BENCHMARK_SOURCE_ROOT) not in sys.path:
-    sys.path.insert(0, str(BENCHMARK_SOURCE_ROOT))
-
-from channel_estimation.models.ammse_rank_adaptive import (  # noqa: E402
-    AMMSERankAdaptiveConfig,
-    AMMSERankAdaptiveModel,
-)
-from elastic_method.core.multi_wrapper import MultiStackTorchEncoderWrapper  # noqa: E402
-from train_oai_ammse_rfsim import EPS, complex_vector_to_channels, resolve_device  # noqa: E402
-from train_oai_elastic_ammse_methods import (  # noqa: E402
-    STACK_PATHS,
-    call_model_for_spec,
-    patch_ammse_matformer,
-)
+from ammse_runtime.elastic import STACK_PATHS, MultiStackTorchEncoderWrapper, call_model_for_spec
+from ammse_runtime.model import AMMSERankAdaptiveConfig, AMMSERankAdaptiveModel
+from ammse_runtime.utils import EPS, complex_vector_to_channels, resolve_device
 
 
 MAGIC = 0x414D4D53
@@ -61,11 +41,8 @@ DYNAMIC_CHECKPOINT_REL = {
     "strujepa": "strujepa/checkpoints/strujepa_best.pt",
     "dynabert": "dynabert/checkpoints/dynabert_best.pt",
     "ofa": "ofa/checkpoints/ofa_best.pt",
-    "matformer": "matformer/checkpoints/matformer_best.pt",
 }
-DEFAULT_RUN_DIR = Path(
-    "/home/users/dky/StruJEPA/runs/oai_elastic_ammse_rfsim_ce/four_methods_true_channel_lowwd_20260529"
-)
+DEFAULT_RUN_DIR = SERVICE_DIR / "runs" / "oai_elastic_ammse_rfsim_ce"
 DEFAULT_STRUJEPA_CHECKPOINT = SERVICE_DIR / "checkpoints" / "strujepa_best.pt"
 
 
@@ -106,9 +83,6 @@ def load_model(method: str, checkpoint_path: Path, device: torch.device) -> tupl
     base = AMMSERankAdaptiveModel(AMMSERankAdaptiveConfig(**model_config))
     if method in {"strujepa", "dynabert", "ofa"}:
         model: nn.Module = MultiStackTorchEncoderWrapper(base, stack_paths=STACK_PATHS)
-    elif method == "matformer":
-        patch_ammse_matformer(base, model_config)
-        model = base
     elif method == "static":
         model = base
     else:
@@ -339,7 +313,7 @@ def serve(args: argparse.Namespace) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
-    parser.add_argument("--method", choices=("static", "strujepa", "dynabert", "ofa", "matformer"), default="strujepa")
+    parser.add_argument("--method", choices=("static", "strujepa", "dynabert", "ofa"), default="strujepa")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--socket", default="/tmp/oai_ammse_ce.sock")
     parser.add_argument("--width", type=float, default=1.0)

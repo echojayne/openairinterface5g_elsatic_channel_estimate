@@ -11,6 +11,8 @@ for the scheduled PUSCH resources.
 
 - `serve_elastic_ammse_ce.py`: Unix-socket inference service for the elastic
   A-MMSE checkpoint.
+- `ammse_runtime/`: self-contained A-MMSE model, elastic Transformer wrapper,
+  and input preprocessing code used by the service at inference time.
 - `run_oai_with_elastic_ammse.sh`: wrapper that starts the service, exports the
   required OAI environment variables, then launches `nr-softmodem`.
 - `checkpoints/strujepa_best.pt`: optional local StruJEPA elastic A-MMSE
@@ -28,13 +30,9 @@ The Python service needs:
 - Python 3
 - `numpy`
 - `torch`
-- the StruJEPA training/evaluation source tree
 
-Set `STRUJEPA_ROOT` if the StruJEPA tree is not at `/home/users/dky/StruJEPA`:
-
-```bash
-export STRUJEPA_ROOT=/path/to/StruJEPA
-```
+No external StruJEPA checkout is required for deployment. The inference-time
+model and elastic runtime code live in `tools/ammse_ce_service/ammse_runtime`.
 
 ## Checkpoint
 
@@ -50,6 +48,129 @@ or pass one explicitly:
 ```bash
 export OAI_AMMSE_CE_CHECKPOINT=/path/to/strujepa_best.pt
 ```
+
+## Full Startup Flow
+
+Run the following from the OAI repository root unless noted otherwise:
+
+```bash
+cd /home/users/dky/openairinterface5g
+```
+
+1. Build the gNB, nrUE, and RFsim targets.
+
+The wrapper defaults to `cmake_targets/ran_build_local/build/nr-softmodem`, so
+this build layout works without extra environment variables:
+
+```bash
+cmake -S . -B cmake_targets/ran_build_local/build -GNinja
+cmake --build cmake_targets/ran_build_local/build --target nr-softmodem nr-uesoftmodem rfsimulator
+```
+
+If you build with OAI's standard `cmake_targets/build_oai` flow instead, set
+`NR_SOFTMODEM` before starting the wrapper and use the matching
+`nr-uesoftmodem` path in the UE command.
+
+2. Download the checkpoint.
+
+Download the Google Drive checkpoint above, then put it at the default service
+path:
+
+```bash
+mkdir -p tools/ammse_ce_service/checkpoints
+# Save the downloaded file as:
+ls -lh tools/ammse_ce_service/checkpoints/strujepa_best.pt
+```
+
+Alternatively keep the checkpoint anywhere and pass its absolute path with
+`OAI_AMMSE_CE_CHECKPOINT`.
+
+3. Configure the Python service environment.
+
+```bash
+export PYTHON_BIN=python3
+export OAI_AMMSE_CE_CHECKPOINT=/home/users/dky/openairinterface5g/tools/ammse_ce_service/checkpoints/strujepa_best.pt
+
+"${PYTHON_BIN}" -c 'import numpy, torch'
+```
+
+The last command is a quick dependency check for the Python service. The
+service imports its own runtime code from `tools/ammse_ce_service`.
+
+4. Start the gNB through the A-MMSE wrapper.
+
+The wrapper starts `serve_elastic_ammse_ce.py`, waits for the Unix socket, exports
+the socket/subnet variables, and then starts `nr-softmodem`.
+
+```bash
+sudo -E env \
+  PYTHON_BIN="${PYTHON_BIN}" \
+  OAI_AMMSE_CE_METHOD=strujepa \
+  OAI_AMMSE_CE_CHECKPOINT="${OAI_AMMSE_CE_CHECKPOINT}" \
+  OAI_AMMSE_CE_WIDTH=0.25 \
+  OAI_AMMSE_CE_DEPTH=0.25 \
+  OAI_AMMSE_CE_NOISE_POWER_DB=-70 \
+  OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv \
+  OAI_CE_NMSE_ENABLE=1 \
+  OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv \
+  tools/ammse_ce_service/run_oai_with_elastic_ammse.sh \
+    --rfsim \
+    --phy-test \
+    --noS1 \
+    -O ci-scripts/conf_files/gnb.band78.106prb.rfsim.phytest-strujepa.conf \
+    --rfsimulator.[0].serveraddr server \
+    --T_stdout 2 \
+    --T_nowait
+```
+
+Use `sudo -E env ...` if your OAI run needs sudo; it preserves the variables the
+wrapper and Python service need.
+
+5. Start the nrUE in another terminal.
+
+```bash
+cd /home/users/dky/openairinterface5g
+
+sudo -E cmake_targets/ran_build_local/build/nr-uesoftmodem \
+  --rfsim \
+  --phy-test \
+  --noS1 \
+  -O ci-scripts/conf_files/nrue.strujepa.rfsim.conf \
+  -r 106 \
+  --numerology 1 \
+  --band 78 \
+  -C 3619200000 \
+  --rfsimulator.[0].serveraddr 127.0.0.1 \
+  --T_stdout 2 \
+  --T_nowait \
+  --T_port 2023
+```
+
+If your PHY-test workflow uses pre-generated RRC files, add:
+
+```bash
+--reconfig-file /path/to/reconfig.raw --rbconfig-file /path/to/rbconfig.raw
+```
+
+6. Change the elastic subnet while OAI is running.
+
+```bash
+printf 'width=0.5 depth=0.75\n' | sudo tee /tmp/oai_ammse_ce_subnet.txt
+```
+
+The gNB polls this file and sends the latest width/depth with each A-MMSE CE
+request.
+
+7. Check runtime outputs.
+
+```bash
+tail -f /tmp/oai_ammse_ce_service.log
+tail -f /tmp/oai_ammse_ce_metrics.csv
+tail -f /tmp/oai_ce_nmse.csv
+```
+
+Stop the gNB wrapper with `Ctrl-C`; its cleanup handler also stops the Python
+A-MMSE service.
 
 ## Basic Run
 
@@ -69,8 +190,8 @@ The wrapper defaults to:
 - `OAI_AMMSE_CE_SERVICE_CSV=/tmp/oai_ammse_ce_service.csv`
 
 Use `OAI_AMMSE_CE_CHECKPOINT` to load a different checkpoint, or
-`OAI_AMMSE_CE_RUN_DIR` with `OAI_AMMSE_CE_METHOD=static|strujepa|dynabert|ofa|matformer`
-to load checkpoints from a StruJEPA run directory.
+`OAI_AMMSE_CE_RUN_DIR` with `OAI_AMMSE_CE_METHOD=static|strujepa|dynabert|ofa`
+to load checkpoints from a local run directory copied into this OAI checkout.
 
 ## Runtime Subnet Selection
 
