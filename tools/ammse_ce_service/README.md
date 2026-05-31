@@ -93,6 +93,13 @@ export OAI_BUILD_DIR=/home/users/dky/openairinterface5g/cmake_targets/ran_build_
 export LD_LIBRARY_PATH="${OAI_BUILD_DIR}:${LD_LIBRARY_PATH:-}"
 export PYTHON_BIN="$(python -c 'import sys; print(sys.executable)')"
 export OAI_AMMSE_CE_CHECKPOINT=/home/users/dky/openairinterface5g/tools/ammse_ce_service/checkpoints/strujepa_best.pt
+export OAI_AMMSE_CE_PRINT_EVERY=100
+export OAI_CE_NMSE_PERIOD=100
+export OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD=1
+export OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL=Rayleigh8
+export OAI_AMMSE_CE_RFSIM_SPEED_KMH=30
+export OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB=-70
+export OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}"
 
 "${PYTHON_BIN}" -c 'import numpy, torch'
 ```
@@ -115,9 +122,15 @@ sudo -E env \
   OAI_AMMSE_CE_CHECKPOINT="${OAI_AMMSE_CE_CHECKPOINT}" \
   OAI_AMMSE_CE_WIDTH=0.25 \
   OAI_AMMSE_CE_DEPTH=0.25 \
-  OAI_AMMSE_CE_NOISE_POWER_DB=-70 \
+  OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_NOISE_POWER_DB}" \
+  OAI_AMMSE_CE_PRINT_EVERY="${OAI_AMMSE_CE_PRINT_EVERY}" \
+  OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD="${OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD}" \
+  OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL="${OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL}" \
+  OAI_AMMSE_CE_RFSIM_SPEED_KMH="${OAI_AMMSE_CE_RFSIM_SPEED_KMH}" \
+  OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}" \
   OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv \
   OAI_CE_NMSE_ENABLE=1 \
+  OAI_CE_NMSE_PERIOD="${OAI_CE_NMSE_PERIOD}" \
   OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv \
   tools/ammse_ce_service/run_oai_with_elastic_ammse.sh \
     --rfsim \
@@ -125,7 +138,6 @@ sudo -E env \
     --noS1 \
     -O ci-scripts/conf_files/gnb.band78.106prb.rfsim.phytest-strujepa.conf \
     '--rfsimulator.[0].serveraddr' server \
-    '--rfsimulator.[0].options' chanmod \
     --T_stdout 2 \
     --T_nowait
 ```
@@ -253,6 +265,30 @@ export OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv
 
 The Python service writes request latency and subnet information to
 `OAI_AMMSE_CE_SERVICE_CSV`.
+
+## Channel and Print Controls
+
+The wrapper accepts environment variables for the common RFsim and logging
+controls:
+
+- `OAI_AMMSE_CE_PRINT_EVERY`: Python service progress print interval in served
+  requests. Set `0` to disable periodic service prints.
+- `OAI_CE_NMSE_PERIOD`: C-side NMSE log/CSV period in PUSCH events.
+- `OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD`: set `1` to append
+  `--rfsimulator.[0].options chanmod`.
+- `OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL`: RFsim uplink channel model, for example
+  `Rayleigh8`.
+- `OAI_AMMSE_CE_RFSIM_SPEED_KMH`: mobile speed. The wrapper converts it to
+  `max_Doppler` using `OAI_AMMSE_CE_RFSIM_CARRIER_HZ`, default
+  `3619200000`.
+- `OAI_AMMSE_CE_RFSIM_MAX_DOPPLER_HZ`: explicit Doppler override. If set, it
+  takes precedence over `OAI_AMMSE_CE_RFSIM_SPEED_KMH`.
+- `OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB`: RFsim channel `noise_power_dB` for
+  `rfsimu_channel_ue0`. Keep `OAI_AMMSE_CE_NOISE_POWER_DB` aligned with this
+  value so the A-MMSE model receives the same assumed noise level.
+- `OAI_AMMSE_CE_RFSIM_CHANNEL_INDEX`: channelmod list index to override. The
+  default `1` is `rfsimu_channel_ue0`, which is the uplink channel used by the
+  gNB A-MMSE hook and NMSE logger.
 
 For RFsim experiments, online CE NMSE logging can be enabled without replacing
 the estimator:
