@@ -16,6 +16,32 @@ SERVICE_CSV="${OAI_AMMSE_CE_SERVICE_CSV:-/tmp/oai_ammse_ce_service.csv}"
 START_TIMEOUT_S="${OAI_AMMSE_CE_START_TIMEOUT_S:-120}"
 
 mkdir -p "$(dirname "${SOCKET_PATH}")" "$(dirname "${SERVICE_LOG}")" "$(dirname "${SERVICE_CSV}")" "$(dirname "${SUBNET_FILE}")"
+
+replace_regular_file() {
+  local path="$1"
+  if [[ -e "${path}" || -L "${path}" ]]; then
+    if [[ ! -f "${path}" && ! -L "${path}" ]]; then
+      echo "Refusing to replace non-regular file: ${path}" >&2
+      exit 1
+    fi
+    rm -f -- "${path}" || {
+      echo "Cannot replace ${path}; remove it or set a different OAI_AMMSE_CE_* path." >&2
+      exit 1
+    }
+  fi
+}
+
+replace_regular_file "${SUBNET_FILE}"
+replace_regular_file "${SERVICE_LOG}"
+replace_regular_file "${SERVICE_CSV}"
+if [[ -n "${OAI_AMMSE_CE_METRICS:-}" ]]; then
+  mkdir -p "$(dirname "${OAI_AMMSE_CE_METRICS}")"
+  replace_regular_file "${OAI_AMMSE_CE_METRICS}"
+fi
+if [[ -n "${OAI_CE_NMSE_CSV:-}" ]]; then
+  mkdir -p "$(dirname "${OAI_CE_NMSE_CSV}")"
+  replace_regular_file "${OAI_CE_NMSE_CSV}"
+fi
 printf 'width=%s depth=%s\n' "${WIDTH}" "${DEPTH}" > "${SUBNET_FILE}"
 
 service_args=(
@@ -40,7 +66,7 @@ if [[ -n "${OAI_AMMSE_CE_NOISE_POWER_DB:-}" ]]; then
   service_args+=(--noise-power-db "${OAI_AMMSE_CE_NOISE_POWER_DB}")
 fi
 
-rm -f "${SOCKET_PATH}"
+rm -f -- "${SOCKET_PATH}"
 "${PYTHON_BIN}" "${service_args[@]}" > "${SERVICE_LOG}" 2>&1 &
 service_pid=$!
 

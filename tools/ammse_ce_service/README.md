@@ -124,7 +124,10 @@ sudo -E env \
 ```
 
 Use `sudo -E env ...` if your OAI run needs sudo; it preserves the variables the
-wrapper and Python service need.
+wrapper and Python service need. The wrapper removes stale default `/tmp`
+subnet, service-log, service-CSV, metrics-CSV, and NMSE-CSV files before
+starting, because root may be unable to truncate user-owned files in sticky
+directories such as `/tmp` on systems with `fs.protected_regular` enabled.
 
 5. Start the nrUE in another terminal.
 
