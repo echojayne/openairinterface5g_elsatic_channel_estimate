@@ -105,6 +105,12 @@ fi
 if [[ -n "${OAI_AMMSE_CE_NOISE_POWER_DB:-}" ]]; then
   service_args+=(--noise-power-db "${OAI_AMMSE_CE_NOISE_POWER_DB}")
 fi
+if [[ -n "${OAI_AMMSE_CE_NOISE_SOURCE:-}" ]]; then
+  service_args+=(--noise-source "${OAI_AMMSE_CE_NOISE_SOURCE}")
+fi
+if [[ -n "${OAI_AMMSE_CE_NVAR_NOISE_SCALE:-}" ]]; then
+  service_args+=(--nvar-noise-scale "${OAI_AMMSE_CE_NVAR_NOISE_SCALE}")
+fi
 if [[ -n "${OAI_AMMSE_CE_PRINT_EVERY:-}" ]]; then
   service_args+=(--print-every "${OAI_AMMSE_CE_PRINT_EVERY}")
 fi

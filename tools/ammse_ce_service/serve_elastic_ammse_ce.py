@@ -141,6 +141,29 @@ def grid_to_c16_payload(grid: np.ndarray) -> bytes:
     return interleaved.tobytes(order="C")
 
 
+def fixed_noise_var(*, noise_power_db: float, noise_reference_db: float) -> float:
+    return 10.0 ** ((float(noise_power_db) - float(noise_reference_db)) / 10.0)
+
+
+def select_noise_var(
+    *,
+    noise_source: str,
+    request_nvar: int,
+    scale: float,
+    nvar_noise_scale: float,
+    noise_power_db: float,
+    noise_reference_db: float,
+) -> tuple[float, str]:
+    fixed = fixed_noise_var(noise_power_db=noise_power_db, noise_reference_db=noise_reference_db)
+    if noise_source in {"auto", "nvar"} and int(request_nvar) > 0:
+        normalized = (float(request_nvar) / (float(scale) * float(scale) + EPS)) * float(nvar_noise_scale)
+        if np.isfinite(normalized) and normalized > 0.0:
+            return float(np.clip(normalized, EPS, 1.0e6)), "prev_nvar"
+        if noise_source == "nvar":
+            return fixed, "prev_nvar_invalid_fixed"
+    return fixed, "fixed"
+
+
 def predict_grid(
     *,
     method: str,
@@ -149,18 +172,29 @@ def predict_grid(
     pilot_mask: np.ndarray,
     noise_reference_db: float,
     noise_power_db: float,
+    noise_source: str,
+    request_nvar: int,
+    nvar_noise_scale: float,
     width: float,
     depth: float,
     raw_grid: np.ndarray,
     device: torch.device,
-) -> np.ndarray:
+) -> tuple[np.ndarray, float, str]:
     flat_mask = pilot_mask.reshape(-1, order="F")
     pilot_vector = raw_grid.reshape(-1, order="F")[flat_mask]
     scale = float(np.sqrt(np.mean(np.abs(pilot_vector) ** 2) + EPS))
     pilot_channels = complex_vector_to_channels(pilot_vector / scale)
     pilot_tensor = torch.from_numpy(pilot_channels[None]).to(device=device, dtype=torch.float32)
+    noise_var_value, noise_source_label = select_noise_var(
+        noise_source=noise_source,
+        request_nvar=request_nvar,
+        scale=scale,
+        nvar_noise_scale=nvar_noise_scale,
+        noise_power_db=noise_power_db,
+        noise_reference_db=noise_reference_db,
+    )
     noise_var = torch.tensor(
-        [10.0 ** ((float(noise_power_db) - float(noise_reference_db)) / 10.0)],
+        [noise_var_value],
         device=device,
         dtype=torch.float32,
     )
@@ -175,7 +209,7 @@ def predict_grid(
             model_config=model_config,
         )
     pred = pred_norm.detach().cpu().numpy()[0]
-    return (pred[0] + 1j * pred[1]) * scale
+    return (pred[0] + 1j * pred[1]) * scale, noise_var_value, noise_source_label
 
 
 def serve(args: argparse.Namespace) -> int:
@@ -193,7 +227,8 @@ def serve(args: argparse.Namespace) -> int:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_handle = log_path.open("w", encoding="utf-8")
         log_handle.write(
-            "request_id,frame,slot,grid_elems,model_us,python_total_us,total_us,method,label,width,depth,noise_power_db\n"
+            "request_id,frame,slot,grid_elems,model_us,python_total_us,total_us,method,label,width,depth,"
+            "noise_power_db,request_nvar,noise_source,noise_var\n"
         )
         log_handle.flush()
 
@@ -211,6 +246,8 @@ def serve(args: argparse.Namespace) -> int:
                 "depth": args.depth,
                 "device": str(device),
                 "noise_power_db": args.noise_power_db,
+                "noise_source": args.noise_source,
+                "nvar_noise_scale": args.nvar_noise_scale,
             },
             ensure_ascii=True,
         ),
@@ -231,6 +268,12 @@ def serve(args: argparse.Namespace) -> int:
                     payload = b""
                     request_width = float(args.width)
                     request_depth = float(args.depth)
+                    request_nvar = 0
+                    noise_var_value = fixed_noise_var(
+                        noise_power_db=float(args.noise_power_db),
+                        noise_reference_db=noise_reference_db,
+                    )
+                    noise_source_label = "fixed"
                     if header["magic"] != MAGIC or header["version"] != VERSION or header["header_bytes"] != REQUEST.size:
                         status = 1
                     if status == 0:
@@ -240,14 +283,18 @@ def serve(args: argparse.Namespace) -> int:
                             raw_grid = c16_payload_to_grid(payload, nb_re=header["nb_re"], nr_symbols=header["nr_symbols"])
                             request_width = float(header["width_ppm"]) / 1_000_000.0 if int(header["width_ppm"]) > 0 else request_width
                             request_depth = float(header["depth_ppm"]) / 1_000_000.0 if int(header["depth_ppm"]) > 0 else request_depth
+                            request_nvar = int(header["nvar"])
                             model_t0 = time.perf_counter()
-                            prediction = predict_grid(
+                            prediction, noise_var_value, noise_source_label = predict_grid(
                                 method=args.method,
                                 model=model,
                                 model_config=model_config,
                                 pilot_mask=pilot_mask,
                                 noise_reference_db=noise_reference_db,
                                 noise_power_db=float(args.noise_power_db),
+                                noise_source=str(args.noise_source),
+                                request_nvar=request_nvar,
+                                nvar_noise_scale=float(args.nvar_noise_scale),
                                 width=request_width,
                                 depth=request_depth,
                                 raw_grid=raw_grid,
@@ -285,7 +332,8 @@ def serve(args: argparse.Namespace) -> int:
                         log_handle.write(
                             f"{header['request_id']},{header['frame']},{header['slot']},{header['grid_elems']},"
                             f"{model_us},{python_total_us},{total_us},{args.method},"
-                            f"w{request_width:g}_d{request_depth:g},{request_width},{request_depth},{args.noise_power_db}\n"
+                            f"w{request_width:g}_d{request_depth:g},{request_width},{request_depth},{args.noise_power_db},"
+                            f"{request_nvar},{noise_source_label},{noise_var_value:.9g}\n"
                         )
                         log_handle.flush()
                     if args.print_every > 0 and served % int(args.print_every) == 0:
@@ -300,6 +348,9 @@ def serve(args: argparse.Namespace) -> int:
                                     "total_us": total_us,
                                     "width": request_width,
                                     "depth": request_depth,
+                                    "request_nvar": request_nvar,
+                                    "noise_source": noise_source_label,
+                                    "noise_var": noise_var_value,
                                 },
                                 ensure_ascii=True,
                             ),
@@ -324,6 +375,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=float, default=1.0)
     parser.add_argument("--label", default="")
     parser.add_argument("--noise-power-db", type=float, default=-70.0)
+    parser.add_argument("--noise-source", choices=("auto", "fixed", "nvar"), default="auto")
+    parser.add_argument("--nvar-noise-scale", type=float, default=1.0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--max-requests", type=int, default=0)
     parser.add_argument("--print-every", type=int, default=20)

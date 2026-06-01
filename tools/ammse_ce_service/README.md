@@ -277,12 +277,19 @@ The metrics CSV writes one row for each A-MMSE request:
 - `python_model_us`: Python model inference time only.
 - `ipc_gap_us`: `c_service_wall_us - python_total_us`. Treat this as the
   socket/process scheduling/serialization gap, not a pure IPC-only number.
+- `nvar_request`: C-side noise estimate sent to Python. This is the previous
+  supported PUSCH event's `nvar`, so it can be used without depending on the
+  current request's completed channel estimate.
+- `nvar_current`: C-side noise estimate produced by the current OAI DMRS
+  estimation pass; it becomes the candidate `nvar_request` for the next request.
 - `status`: `0` means the A-MMSE replacement was applied. Negative values mean
   the hook attempted a request but the service response was not usable.
 
 The Python service writes matching request latency and subnet information to
 `OAI_AMMSE_CE_SERVICE_CSV`. Its `total_us` includes response sending; the
-`python_total_us` column is the value returned to the C process.
+`python_total_us` column is the value returned to the C process. With
+`OAI_AMMSE_CE_NOISE_SOURCE=auto`, the service CSV also records the request
+`nvar`, selected noise source, and normalized noise value used by the model.
 
 To print the same C/Python timing fields in the gNB terminal while it is
 running, set:
@@ -317,7 +324,14 @@ controls:
   takes precedence over `OAI_AMMSE_CE_RFSIM_SPEED_KMH`.
 - `OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB`: RFsim channel `noise_power_dB` for
   `rfsimu_channel_ue0`. Keep `OAI_AMMSE_CE_NOISE_POWER_DB` aligned with this
-  value so the A-MMSE model receives the same assumed noise level.
+  value so the A-MMSE model has a fixed-noise fallback.
+- `OAI_AMMSE_CE_NOISE_SOURCE`: `auto` by default. `auto` uses the previous
+  C-side PUSCH noise estimate when available and falls back to
+  `OAI_AMMSE_CE_NOISE_POWER_DB` for the first request. Set `fixed` to always use
+  `OAI_AMMSE_CE_NOISE_POWER_DB`, or `nvar` to request the same previous-`nvar`
+  path explicitly.
+- `OAI_AMMSE_CE_NVAR_NOISE_SCALE`: optional multiplier applied after normalizing
+  the previous C-side `nvar` by the current raw-DMRS pilot power.
 - `OAI_AMMSE_CE_RFSIM_CHANNEL_INDEX`: channelmod list index to override. The
   default `1` is `rfsimu_channel_ue0`, which is the uplink channel used by the
   gNB A-MMSE hook and NMSE logger.
@@ -334,12 +348,11 @@ tail -f "${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/ce_nmse.csv"
 
 The NMSE logger compares the applied channel estimate, the stock OAI
 interpolated estimate, and raw DMRS-position LS estimates against the RFsim true
-channel for the scheduled PUSCH grid. `ammse_all_re` and `oai_inter_all_re` use
-the same all-RE replay convention as `rayleigh8_pareto_all_re_grid.png`:
-`oai_inter_all_re` follows the T-tracer `raw-inter-ce-fd-data` layout, so REs
-not emitted by OAI's extractor remain zero. `raw_dmrs` is the raw LS estimate on
-the DMRS support only, while `raw_dmrs_all_re` is the sparse raw-DMRS all-RE
-baseline used by the replay plots. The gNB command must enable
+channel for the scheduled PUSCH grid. `ammse_all_re` and `oai_inter_all_re` now
+use the same physical all-RE grid convention over the scheduled PUSCH allocation.
+`raw_dmrs` is the raw LS estimate on the DMRS support only, while
+`raw_dmrs_all_re` is the sparse raw-DMRS all-RE baseline used by the replay
+plots. The gNB command must enable
 `'--rfsimulator.[0].options' chanmod`; otherwise RFsim does not allocate the
 `rfsimu_channel_ue0`/`rfsimu_channel_enB0` descriptors and the logger reports
 `CE NMSE logger has no RFsim true channel`. A-MMSE inference still runs in that

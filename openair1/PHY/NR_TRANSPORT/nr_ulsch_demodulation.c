@@ -180,6 +180,8 @@ typedef struct {
   uint32_t python_total_us;
   int64_t ipc_gap_us;
   int max_ch;
+  uint32_t nvar_request;
+  uint32_t nvar_current;
 } oai_ammse_ce_timing_t;
 
 typedef struct {
@@ -190,11 +192,13 @@ typedef struct {
   bool warned_subnet_file;
   int fd;
   uint32_t request_id;
+  uint32_t last_nvar;
   uint32_t width_ppm;
   uint32_t depth_ppm;
   uint64_t last_subnet_check_us;
   uint64_t subnet_poll_us;
   uint32_t timing_print_every;
+  bool have_last_nvar;
   time_t subnet_file_mtime;
   long subnet_file_mtime_nsec;
   char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
@@ -991,7 +995,7 @@ static void oai_ammse_ce_init(void)
     if (state->metrics_fp != NULL) {
       fprintf(state->metrics_fp,
               "request_id,frame,slot,rb_size,nr_symbols,grid_elems,width,depth,status,c_ce_total_us,"
-              "c_service_wall_us,python_total_us,python_model_us,ipc_gap_us,max_ch\n");
+              "c_service_wall_us,python_total_us,python_model_us,ipc_gap_us,max_ch,nvar_request,nvar_current\n");
       fflush(state->metrics_fp);
     } else {
       LOG_W(PHY, "failed to open OAI_AMMSE_CE_METRICS=%s: %s\n", metrics_path, strerror(errno));
@@ -1011,7 +1015,7 @@ static void oai_ammse_ce_record_metrics(const oai_ammse_ce_timing_t *timing, uin
     return;
   if (state->metrics_fp != NULL) {
     fprintf(state->metrics_fp,
-            "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%d,%llu,%llu,%u,%u,%lld,%d\n",
+            "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%d,%llu,%llu,%u,%u,%lld,%d,%u,%u\n",
             timing->request_id,
             timing->frame,
             timing->slot,
@@ -1026,13 +1030,16 @@ static void oai_ammse_ce_record_metrics(const oai_ammse_ce_timing_t *timing, uin
             timing->python_total_us,
             timing->python_model_us,
             (long long)timing->ipc_gap_us,
-            timing->max_ch);
+            timing->max_ch,
+            timing->nvar_request,
+            timing->nvar_current);
     fflush(state->metrics_fp);
   }
   if (state->timing_print_every > 0 && timing->request_id % state->timing_print_every == 0) {
     LOG_I(PHY,
           "A-MMSE CE timing request=%u frame=%u slot=%u status=%d c_ce_total=%llu us c_service=%llu us "
-          "python_total=%u us python_model=%u us ipc_gap=%lld us width=%.6g depth=%.6g max_ch=%d\n",
+          "python_total=%u us python_model=%u us ipc_gap=%lld us width=%.6g depth=%.6g max_ch=%d "
+          "nvar_request=%u nvar_current=%u\n",
           timing->request_id,
           timing->frame,
           timing->slot,
@@ -1044,7 +1051,9 @@ static void oai_ammse_ce_record_metrics(const oai_ammse_ce_timing_t *timing, uin
           (long long)timing->ipc_gap_us,
           timing->width,
           timing->depth,
-          timing->max_ch);
+          timing->max_ch,
+          timing->nvar_request,
+          timing->nvar_current);
   }
 }
 
@@ -1152,11 +1161,11 @@ static void apply_ammse_ce_grid(NR_gNB_PUSCH *pusch_vars,
 }
 
 #if T_TRACER
-static void copy_oai_inter_trace_grid_for_nmse(const NR_DL_FRAME_PARMS *frame_parms,
-                                               const nfapi_nr_pusch_pdu_t *rel15_ul,
-                                               const c16_t *oai_inter_stream,
-                                               int chest_time,
-                                               c16_t *dst_grid)
+static void copy_oai_inter_full_grid_for_nmse(const NR_DL_FRAME_PARMS *frame_parms,
+                                              const nfapi_nr_pusch_pdu_t *rel15_ul,
+                                              const c16_t *oai_inter_stream,
+                                              int chest_time,
+                                              c16_t *dst_grid)
 {
   const int nb_re = rel15_ul->rb_size * NR_NB_SC_PER_RB;
   const int grid_elems = nb_re * rel15_ul->nr_of_symbols;
@@ -1175,18 +1184,7 @@ static void copy_oai_inter_trace_grid_for_nmse(const NR_DL_FRAME_PARMS *frame_pa
 
     const c16_t *src_symbol = &oai_inter_stream[dmrs_symbol * frame_parms->ofdm_symbol_size];
     c16_t *dst_symbol = &dst_grid[rel_symbol * nb_re];
-    if (dmrs_symbol_flag == 0) {
-      memcpy(dst_symbol, src_symbol, sizeof(c16_t) * nb_re);
-    } else if (rel15_ul->dmrs_config_type == pusch_dmrs_type1) {
-      for (int idx = 1; idx < nb_re; idx += 2)
-        *dst_symbol++ = src_symbol[idx];
-    } else {
-      for (int idx = 0; idx < nb_re; idx++) {
-        if (idx % 6 == 0 || idx % 6 == 1)
-          continue;
-        *dst_symbol++ = src_symbol[idx];
-      }
-    }
+    memcpy(dst_symbol, src_symbol, sizeof(c16_t) * nb_re);
   }
 }
 #endif
@@ -1206,6 +1204,12 @@ static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
     memset(timing, 0, sizeof(*timing));
   if (!oai_ammse_ce_enabled())
     return false;
+  oai_ammse_ce_state_t *state = &oai_ammse_ce_state;
+  const uint32_t request_nvar = state->have_last_nvar ? state->last_nvar : 0;
+  if (nvar > 0) {
+    state->last_nvar = nvar;
+    state->have_last_nvar = true;
+  }
   NR_DL_FRAME_PARMS *frame_parms = &gNB->frame_parms;
   const int nb_rx_ant = frame_parms->nb_antennas_rx;
   const int nb_layer = rel15_ul->nrOfLayers;
@@ -1230,7 +1234,6 @@ static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
     return false;
 
   c16_t response_grid[grid_elems] __attribute__((aligned(64)));
-  oai_ammse_ce_state_t *state = &oai_ammse_ce_state;
   oai_ammse_ce_load_subnet_from_file(state);
   oai_ammse_ce_request_header_t req = {
       .magic = OAI_AMMSE_CE_MAGIC,
@@ -1246,7 +1249,7 @@ static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
       .grid_elems = grid_elems,
       .nr_layers = nb_layer,
       .nb_rx_ant = nb_rx_ant,
-      .nvar = nvar,
+      .nvar = request_nvar,
       .width_ppm = state->width_ppm,
       .depth_ppm = state->depth_ppm,
   };
@@ -1262,6 +1265,8 @@ static bool oai_ammse_ce_try_replace(PHY_VARS_gNB *gNB,
     timing->depth = oai_ammse_ce_ppm_to_value(req.depth_ppm);
     timing->status = -1;
     timing->max_ch = *max_ch;
+    timing->nvar_request = request_nvar;
+    timing->nvar_current = nvar;
   }
 
   const uint64_t t0 = monotonic_time_us();
@@ -2567,7 +2572,7 @@ int nr_rx_pusch_tp(PHY_VARS_gNB *gNB,
   c16_t *oai_inter_grid_for_nmse = NULL;
   if (oai_ce_nmse_enabled() && rel15_ul->nrOfLayers == 1 && frame_parms->nb_antennas_rx == 1) {
     const c16_t *oai_inter_stream = (const c16_t *)pusch_vars->ul_ch_estimates[0];
-    copy_oai_inter_trace_grid_for_nmse(frame_parms, rel15_ul, oai_inter_stream, gNB->chest_time, oai_inter_ch_est_slot_mem);
+    copy_oai_inter_full_grid_for_nmse(frame_parms, rel15_ul, oai_inter_stream, gNB->chest_time, oai_inter_ch_est_slot_mem);
     oai_inter_grid_for_nmse = oai_inter_ch_est_slot_mem;
   }
 #endif
