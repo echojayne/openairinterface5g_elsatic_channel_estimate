@@ -100,6 +100,7 @@ export OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL=Rayleigh8
 export OAI_AMMSE_CE_RFSIM_SPEED_KMH=0
 export OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB=-70
 export OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}"
+export OAI_AMMSE_CE_TIMING_PRINT_EVERY=100
 
 "${PYTHON_BIN}" -c 'import numpy, torch'
 ```
@@ -128,6 +129,7 @@ sudo -E env \
   OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL="${OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL}" \
   OAI_AMMSE_CE_RFSIM_SPEED_KMH="${OAI_AMMSE_CE_RFSIM_SPEED_KMH}" \
   OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}" \
+  OAI_AMMSE_CE_TIMING_PRINT_EVERY="${OAI_AMMSE_CE_TIMING_PRINT_EVERY}" \
   OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv \
   OAI_CE_NMSE_ENABLE=1 \
   OAI_CE_NMSE_PERIOD="${OAI_CE_NMSE_PERIOD}" \
@@ -282,6 +284,17 @@ The Python service writes matching request latency and subnet information to
 `OAI_AMMSE_CE_SERVICE_CSV`. Its `total_us` includes response sending; the
 `python_total_us` column is the value returned to the C process.
 
+To print the same C/Python timing fields in the gNB terminal while it is
+running, set:
+
+```bash
+export OAI_AMMSE_CE_TIMING_PRINT_EVERY=100
+```
+
+Use `1` to print every A-MMSE request. Use `0` or leave it unset to disable live
+timing prints. `OAI_AMMSE_CE_TIMING_PRINT=1` is a shortcut for printing every
+request unless `OAI_AMMSE_CE_TIMING_PRINT_EVERY` is also set.
+
 ## Channel and Print Controls
 
 The wrapper accepts environment variables for the common RFsim and logging
@@ -289,6 +302,8 @@ controls:
 
 - `OAI_AMMSE_CE_PRINT_EVERY`: Python service progress print interval in served
   requests. Set `0` to disable periodic service prints.
+- `OAI_AMMSE_CE_TIMING_PRINT_EVERY`: C-side A-MMSE timing log interval in
+  requests. Set `1` to print every request, or `0` to disable.
 - `OAI_CE_NMSE_PERIOD`: C-side NMSE log/CSV period in PUSCH events.
 - `OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD`: set `1` to append
   `--rfsimulator.[0].options chanmod`.

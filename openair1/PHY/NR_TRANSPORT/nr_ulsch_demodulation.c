@@ -194,6 +194,7 @@ typedef struct {
   uint32_t depth_ppm;
   uint64_t last_subnet_check_us;
   uint64_t subnet_poll_us;
+  uint32_t timing_print_every;
   time_t subnet_file_mtime;
   long subnet_file_mtime_nsec;
   char socket_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
@@ -206,6 +207,7 @@ static bool oai_ammse_ce_applied_for_current_pusch = false;
 
 static uint32_t oai_ammse_ce_value_to_ppm(double value);
 static double oai_ammse_ce_ppm_to_value(uint32_t value_ppm);
+static bool oai_ammse_ce_env_flag_enabled(const char *name);
 static bool oai_ammse_ce_parse_width_depth(const char *text, uint32_t *width_ppm, uint32_t *depth_ppm);
 static void oai_ammse_ce_load_subnet_from_file(oai_ammse_ce_state_t *state);
 
@@ -855,6 +857,15 @@ static double oai_ammse_ce_ppm_to_value(uint32_t value_ppm)
   return (double)value_ppm / 1000000.0;
 }
 
+static bool oai_ammse_ce_env_flag_enabled(const char *name)
+{
+  const char *value = getenv(name);
+  if (value == NULL || value[0] == '\0')
+    return false;
+  return strcmp(value, "0") != 0 && strcasecmp(value, "false") != 0 && strcasecmp(value, "no") != 0
+         && strcasecmp(value, "off") != 0;
+}
+
 static bool oai_ammse_ce_parse_width_depth(const char *text, uint32_t *width_ppm, uint32_t *depth_ppm)
 {
   double width = 0.0;
@@ -967,6 +978,13 @@ static void oai_ammse_ce_init(void)
       oai_ammse_ce_load_subnet_from_file(state);
     }
   }
+  if (oai_ammse_ce_env_flag_enabled("OAI_AMMSE_CE_TIMING_PRINT"))
+    state->timing_print_every = 1;
+  const char *timing_print_every = getenv("OAI_AMMSE_CE_TIMING_PRINT_EVERY");
+  if (timing_print_every != NULL && timing_print_every[0] != '\0') {
+    unsigned long parsed = strtoul(timing_print_every, NULL, 10);
+    state->timing_print_every = parsed > UINT32_MAX ? UINT32_MAX : (uint32_t)parsed;
+  }
   const char *metrics_path = getenv("OAI_AMMSE_CE_METRICS");
   if (metrics_path != NULL && metrics_path[0] != '\0') {
     state->metrics_fp = fopen(metrics_path, "w");
@@ -989,26 +1007,45 @@ static void oai_ammse_ce_init(void)
 static void oai_ammse_ce_record_metrics(const oai_ammse_ce_timing_t *timing, uint64_t c_ce_total_us)
 {
   oai_ammse_ce_state_t *state = &oai_ammse_ce_state;
-  if (state->metrics_fp == NULL || timing == NULL || !timing->attempted)
+  if (timing == NULL || !timing->attempted)
     return;
-  fprintf(state->metrics_fp,
-          "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%d,%llu,%llu,%u,%u,%lld,%d\n",
+  if (state->metrics_fp != NULL) {
+    fprintf(state->metrics_fp,
+            "%u,%u,%u,%u,%u,%u,%.6g,%.6g,%d,%llu,%llu,%u,%u,%lld,%d\n",
+            timing->request_id,
+            timing->frame,
+            timing->slot,
+            timing->rb_size,
+            timing->nr_symbols,
+            timing->grid_elems,
+            timing->width,
+            timing->depth,
+            timing->status,
+            (unsigned long long)c_ce_total_us,
+            (unsigned long long)timing->c_service_wall_us,
+            timing->python_total_us,
+            timing->python_model_us,
+            (long long)timing->ipc_gap_us,
+            timing->max_ch);
+    fflush(state->metrics_fp);
+  }
+  if (state->timing_print_every > 0 && timing->request_id % state->timing_print_every == 0) {
+    LOG_I(PHY,
+          "A-MMSE CE timing request=%u frame=%u slot=%u status=%d c_ce_total=%llu us c_service=%llu us "
+          "python_total=%u us python_model=%u us ipc_gap=%lld us width=%.6g depth=%.6g max_ch=%d\n",
           timing->request_id,
           timing->frame,
           timing->slot,
-          timing->rb_size,
-          timing->nr_symbols,
-          timing->grid_elems,
-          timing->width,
-          timing->depth,
           timing->status,
           (unsigned long long)c_ce_total_us,
           (unsigned long long)timing->c_service_wall_us,
           timing->python_total_us,
           timing->python_model_us,
           (long long)timing->ipc_gap_us,
+          timing->width,
+          timing->depth,
           timing->max_ch);
-  fflush(state->metrics_fp);
+  }
 }
 
 bool oai_ammse_ce_enabled(void)
