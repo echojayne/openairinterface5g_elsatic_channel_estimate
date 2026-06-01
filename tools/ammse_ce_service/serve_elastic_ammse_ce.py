@@ -17,16 +17,16 @@ import time
 from pathlib import Path
 from typing import Any
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/oai_ammse_matplotlib")
-os.environ.setdefault("XDG_CACHE_HOME", "/tmp/oai_ammse_cache")
+SERVICE_DIR = Path(__file__).resolve().parent
+DEFAULT_CACHE_DIR = SERVICE_DIR / "runs" / ".cache"
+os.environ.setdefault("MPLCONFIGDIR", str(DEFAULT_CACHE_DIR / "matplotlib"))
+os.environ.setdefault("XDG_CACHE_HOME", str(DEFAULT_CACHE_DIR / "xdg"))
 Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
 Path(os.environ["XDG_CACHE_HOME"]).mkdir(parents=True, exist_ok=True)
 
 import numpy as np
 import torch
 from torch import nn
-
-SERVICE_DIR = Path(__file__).resolve().parent
 
 from ammse_runtime.elastic import STACK_PATHS, MultiStackTorchEncoderWrapper, call_model_for_spec
 from ammse_runtime.model import AMMSERankAdaptiveConfig, AMMSERankAdaptiveModel
@@ -319,7 +319,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
     parser.add_argument("--method", choices=("static", "strujepa", "dynabert", "ofa"), default="strujepa")
     parser.add_argument("--checkpoint", default="")
-    parser.add_argument("--socket", default="/tmp/oai_ammse_ce.sock")
+    parser.add_argument("--socket", default=str(SERVICE_DIR / "runs" / "manual" / "runtime" / "sock"))
     parser.add_argument("--width", type=float, default=1.0)
     parser.add_argument("--depth", type=float, default=1.0)
     parser.add_argument("--label", default="")

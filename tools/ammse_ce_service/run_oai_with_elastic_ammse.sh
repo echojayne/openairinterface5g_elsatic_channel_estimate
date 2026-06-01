@@ -7,16 +7,32 @@ OAI_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 NR_SOFTMODEM="${NR_SOFTMODEM:-${OAI_ROOT}/cmake_targets/ran_build_local/build/nr-softmodem}"
 OAI_BUILD_DIR="$(cd "$(dirname "${NR_SOFTMODEM}")" && pwd)"
-SOCKET_PATH="${OAI_AMMSE_CE_SOCKET:-/tmp/oai_ammse_ce.sock}"
+RUN_ROOT="${OAI_AMMSE_CE_OUTPUT_ROOT:-${SCRIPT_DIR}/runs}"
+RUN_ID="${OAI_AMMSE_CE_RUN_ID:-$(date +%Y%m%d_%H%M%S)_$$}"
+OUTPUT_DIR="${OAI_AMMSE_CE_OUTPUT_DIR:-${RUN_ROOT}/${RUN_ID}}"
+LOG_DIR="${OUTPUT_DIR}/logs"
+METRICS_DIR="${OUTPUT_DIR}/metrics"
+RUNTIME_DIR="${OUTPUT_DIR}/runtime"
+CACHE_DIR="${OUTPUT_DIR}/cache"
+SOCKET_PATH="${OAI_AMMSE_CE_SOCKET:-${RUNTIME_DIR}/sock}"
 METHOD="${OAI_AMMSE_CE_METHOD:-strujepa}"
 WIDTH="${OAI_AMMSE_CE_WIDTH:-1.0}"
 DEPTH="${OAI_AMMSE_CE_DEPTH:-1.0}"
-SUBNET_FILE="${OAI_AMMSE_CE_SUBNET_FILE:-/tmp/oai_ammse_ce_subnet.txt}"
-SERVICE_LOG="${OAI_AMMSE_CE_SERVICE_LOG:-/tmp/oai_ammse_ce_service.log}"
-SERVICE_CSV="${OAI_AMMSE_CE_SERVICE_CSV:-/tmp/oai_ammse_ce_service.csv}"
+SUBNET_FILE="${OAI_AMMSE_CE_SUBNET_FILE:-${RUNTIME_DIR}/subnet.txt}"
+SERVICE_LOG="${OAI_AMMSE_CE_SERVICE_LOG:-${LOG_DIR}/service.log}"
+SERVICE_CSV="${OAI_AMMSE_CE_SERVICE_CSV:-${METRICS_DIR}/service.csv}"
+AMMSE_METRICS_CSV="${OAI_AMMSE_CE_METRICS:-${METRICS_DIR}/c_timing.csv}"
+NMSE_CSV="${OAI_CE_NMSE_CSV:-${METRICS_DIR}/ce_nmse.csv}"
+SOFTMODEM_LOG="${OAI_AMMSE_CE_SOFTMODEM_LOG:-${LOG_DIR}/nr-softmodem.log}"
 START_TIMEOUT_S="${OAI_AMMSE_CE_START_TIMEOUT_S:-120}"
 
-mkdir -p "$(dirname "${SOCKET_PATH}")" "$(dirname "${SERVICE_LOG}")" "$(dirname "${SERVICE_CSV}")" "$(dirname "${SUBNET_FILE}")"
+mkdir -p "${LOG_DIR}" "${METRICS_DIR}" "${RUNTIME_DIR}" "${CACHE_DIR}" \
+  "$(dirname "${SOCKET_PATH}")" "$(dirname "${SERVICE_LOG}")" "$(dirname "${SERVICE_CSV}")" \
+  "$(dirname "${SUBNET_FILE}")" "$(dirname "${AMMSE_METRICS_CSV}")" "$(dirname "${NMSE_CSV}")" \
+  "$(dirname "${SOFTMODEM_LOG}")"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${CACHE_DIR}/matplotlib}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${CACHE_DIR}/xdg}"
+mkdir -p "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
 
 replace_regular_file() {
   local path="$1"
@@ -35,14 +51,9 @@ replace_regular_file() {
 replace_regular_file "${SUBNET_FILE}"
 replace_regular_file "${SERVICE_LOG}"
 replace_regular_file "${SERVICE_CSV}"
-if [[ -n "${OAI_AMMSE_CE_METRICS:-}" ]]; then
-  mkdir -p "$(dirname "${OAI_AMMSE_CE_METRICS}")"
-  replace_regular_file "${OAI_AMMSE_CE_METRICS}"
-fi
-if [[ -n "${OAI_CE_NMSE_CSV:-}" ]]; then
-  mkdir -p "$(dirname "${OAI_CE_NMSE_CSV}")"
-  replace_regular_file "${OAI_CE_NMSE_CSV}"
-fi
+replace_regular_file "${AMMSE_METRICS_CSV}"
+replace_regular_file "${NMSE_CSV}"
+replace_regular_file "${SOFTMODEM_LOG}"
 printf 'width=%s depth=%s\n' "${WIDTH}" "${DEPTH}" > "${SUBNET_FILE}"
 
 if ! "${PYTHON_BIN}" - <<'PY'
@@ -140,12 +151,16 @@ print_service_log_tail() {
 }
 
 rm -f -- "${SOCKET_PATH}"
+echo "A-MMSE CE output directory: ${OUTPUT_DIR}" >&2
 "${PYTHON_BIN}" "${service_args[@]}" > "${SERVICE_LOG}" 2>&1 &
 service_pid=$!
 
 cleanup() {
   kill "${service_pid}" >/dev/null 2>&1 || true
   wait "${service_pid}" >/dev/null 2>&1 || true
+  if [[ -n "${SUDO_UID:-}" && -n "${SUDO_GID:-}" && "${OUTPUT_DIR}" == "${RUN_ROOT}"/* ]]; then
+    chown -R "${SUDO_UID}:${SUDO_GID}" "${OUTPUT_DIR}" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -172,5 +187,21 @@ export OAI_AMMSE_CE_SOCKET="${SOCKET_PATH}"
 export OAI_AMMSE_CE_WIDTH="${WIDTH}"
 export OAI_AMMSE_CE_DEPTH="${DEPTH}"
 export OAI_AMMSE_CE_SUBNET_FILE="${SUBNET_FILE}"
+export OAI_AMMSE_CE_METRICS="${AMMSE_METRICS_CSV}"
+export OAI_CE_NMSE_CSV="${NMSE_CSV}"
+export OAI_AMMSE_CE_OUTPUT_DIR="${OUTPUT_DIR}"
+export OAI_AMMSE_CE_SOFTMODEM_LOG="${SOFTMODEM_LOG}"
 
-"${NR_SOFTMODEM}" "$@" "${softmodem_extra_args[@]}"
+if [[ "${OAI_AMMSE_CE_TEE_SOFTMODEM_LOG:-1}" == "0" ]]; then
+  "${NR_SOFTMODEM}" "$@" "${softmodem_extra_args[@]}"
+else
+  set +e
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL "${NR_SOFTMODEM}" "$@" "${softmodem_extra_args[@]}" 2>&1 | tee -a "${SOFTMODEM_LOG}"
+  else
+    "${NR_SOFTMODEM}" "$@" "${softmodem_extra_args[@]}" 2>&1 | tee -a "${SOFTMODEM_LOG}"
+  fi
+  softmodem_status=${PIPESTATUS[0]}
+  set -e
+  exit "${softmodem_status}"
+fi

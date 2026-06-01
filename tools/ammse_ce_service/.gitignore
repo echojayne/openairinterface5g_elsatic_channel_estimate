@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 checkpoints/*.pt
+runs/*
+!runs/.gitkeep

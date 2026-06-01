@@ -93,6 +93,7 @@ export OAI_BUILD_DIR=/home/users/dky/openairinterface5g/cmake_targets/ran_build_
 export LD_LIBRARY_PATH="${OAI_BUILD_DIR}:${LD_LIBRARY_PATH:-}"
 export PYTHON_BIN="$(python -c 'import sys; print(sys.executable)')"
 export OAI_AMMSE_CE_CHECKPOINT=/home/users/dky/openairinterface5g/tools/ammse_ce_service/checkpoints/strujepa_best.pt
+export OAI_AMMSE_CE_OUTPUT_DIR=/home/users/dky/openairinterface5g/tools/ammse_ce_service/runs/rayleigh8_$(date +%Y%m%d_%H%M%S)
 export OAI_AMMSE_CE_PRINT_EVERY=100
 export OAI_CE_NMSE_PERIOD=100
 export OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD=1
@@ -119,6 +120,7 @@ the socket/subnet variables, and then starts `nr-softmodem`.
 sudo -E env \
   PYTHON_BIN="${PYTHON_BIN}" \
   LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
+  OAI_AMMSE_CE_OUTPUT_DIR="${OAI_AMMSE_CE_OUTPUT_DIR}" \
   OAI_AMMSE_CE_METHOD=strujepa \
   OAI_AMMSE_CE_CHECKPOINT="${OAI_AMMSE_CE_CHECKPOINT}" \
   OAI_AMMSE_CE_WIDTH=0.25 \
@@ -130,10 +132,8 @@ sudo -E env \
   OAI_AMMSE_CE_RFSIM_SPEED_KMH="${OAI_AMMSE_CE_RFSIM_SPEED_KMH}" \
   OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}" \
   OAI_AMMSE_CE_TIMING_PRINT_EVERY="${OAI_AMMSE_CE_TIMING_PRINT_EVERY}" \
-  OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv \
   OAI_CE_NMSE_ENABLE=1 \
   OAI_CE_NMSE_PERIOD="${OAI_CE_NMSE_PERIOD}" \
-  OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv \
   tools/ammse_ce_service/run_oai_with_elastic_ammse.sh \
     --rfsim \
     --phy-test \
@@ -147,10 +147,10 @@ sudo -E env \
 Use `sudo -E env ...` if your OAI run needs sudo; it preserves the variables the
 wrapper and Python service need. The wrapper also adds the `nr-softmodem` build
 directory to `LD_LIBRARY_PATH`, but exporting it here makes the same setting
-available to commands you run outside the wrapper. It removes stale default
-`/tmp` subnet, service-log, service-CSV, metrics-CSV, and NMSE-CSV files before
-starting, because root may be unable to truncate user-owned files in sticky
-directories such as `/tmp` on systems with `fs.protected_regular` enabled.
+available to commands you run outside the wrapper. By default this wrapper keeps
+all generated files under `tools/ammse_ce_service/runs/<run_id>/` rather than
+`/tmp`, and mirrors the gNB stdout/stderr to
+`${OAI_AMMSE_CE_OUTPUT_DIR}/logs/nr-softmodem.log`.
 
 5. Start the nrUE in another terminal.
 
@@ -187,7 +187,7 @@ If your PHY-test workflow uses pre-generated RRC files, add:
 6. Change the elastic subnet while OAI is running.
 
 ```bash
-printf 'width=0.5 depth=0.75\n' | sudo tee /tmp/oai_ammse_ce_subnet.txt
+printf 'width=0.5 depth=0.75\n' | sudo tee "${OAI_AMMSE_CE_OUTPUT_DIR}/runtime/subnet.txt"
 ```
 
 The gNB polls this file and sends the latest width/depth with each A-MMSE CE
@@ -196,9 +196,10 @@ request.
 7. Check runtime outputs.
 
 ```bash
-tail -f /tmp/oai_ammse_ce_service.log
-tail -f /tmp/oai_ammse_ce_metrics.csv
-tail -f /tmp/oai_ce_nmse.csv
+tail -f "${OAI_AMMSE_CE_OUTPUT_DIR}/logs/nr-softmodem.log"
+tail -f "${OAI_AMMSE_CE_OUTPUT_DIR}/logs/service.log"
+tail -f "${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/c_timing.csv"
+tail -f "${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/ce_nmse.csv"
 ```
 
 Stop the gNB wrapper with `Ctrl-C`; its cleanup handler also stops the Python
@@ -216,10 +217,22 @@ tools/ammse_ce_service/run_oai_with_elastic_ammse.sh <nr-softmodem args>
 The wrapper defaults to:
 
 - `NR_SOFTMODEM=cmake_targets/ran_build_local/build/nr-softmodem`
-- `OAI_AMMSE_CE_SOCKET=/tmp/oai_ammse_ce.sock`
-- `OAI_AMMSE_CE_SUBNET_FILE=/tmp/oai_ammse_ce_subnet.txt`
-- `OAI_AMMSE_CE_SERVICE_LOG=/tmp/oai_ammse_ce_service.log`
-- `OAI_AMMSE_CE_SERVICE_CSV=/tmp/oai_ammse_ce_service.csv`
+- `OAI_AMMSE_CE_OUTPUT_ROOT=tools/ammse_ce_service/runs`
+- `OAI_AMMSE_CE_OUTPUT_DIR=${OAI_AMMSE_CE_OUTPUT_ROOT}/<timestamp>_<pid>`
+- `OAI_AMMSE_CE_SOCKET=${OAI_AMMSE_CE_OUTPUT_DIR}/runtime/sock`
+- `OAI_AMMSE_CE_SUBNET_FILE=${OAI_AMMSE_CE_OUTPUT_DIR}/runtime/subnet.txt`
+- `OAI_AMMSE_CE_SERVICE_LOG=${OAI_AMMSE_CE_OUTPUT_DIR}/logs/service.log`
+- `OAI_AMMSE_CE_SOFTMODEM_LOG=${OAI_AMMSE_CE_OUTPUT_DIR}/logs/nr-softmodem.log`
+- `OAI_AMMSE_CE_SERVICE_CSV=${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/service.csv`
+- `OAI_AMMSE_CE_METRICS=${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/c_timing.csv`
+- `OAI_CE_NMSE_CSV=${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/ce_nmse.csv`
+
+The run directory is organized by purpose:
+
+- `logs/`: Python service log and mirrored `nr-softmodem` terminal output.
+- `metrics/`: Python service timing CSV, C-side timing CSV, and CE NMSE CSV.
+- `runtime/`: Unix socket and elastic subnet control file.
+- `cache/`: per-run Python cache directories used by matplotlib/XDG clients.
 
 Use `OAI_AMMSE_CE_CHECKPOINT` to load a different checkpoint, or
 `OAI_AMMSE_CE_RUN_DIR` with `OAI_AMMSE_CE_METHOD=static|strujepa|dynabert|ofa`
@@ -231,7 +244,7 @@ The gNB polls the subnet file and sends the current width/depth in each A-MMSE
 CE request. Update the file while OAI is running:
 
 ```bash
-printf 'width=0.5 depth=0.75\n' > /tmp/oai_ammse_ce_subnet.txt
+printf 'width=0.5 depth=0.75\n' > "${OAI_AMMSE_CE_OUTPUT_DIR}/runtime/subnet.txt"
 ```
 
 The parser also accepts:
@@ -259,10 +272,10 @@ falls back to the stock OAI channel estimate.
 
 ## Metrics and NMSE Logging
 
-Set `OAI_AMMSE_CE_METRICS` to write C-side request timing and status:
+The wrapper writes C-side request timing and status by default:
 
 ```bash
-export OAI_AMMSE_CE_METRICS=/tmp/oai_ammse_ce_metrics.csv
+tail -f "${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/c_timing.csv"
 ```
 
 The metrics CSV writes one row for each A-MMSE request:
@@ -321,13 +334,15 @@ controls:
 - `OAI_AMMSE_CE_RFSIM_CHANNEL_INDEX`: channelmod list index to override. The
   default `1` is `rfsimu_channel_ue0`, which is the uplink channel used by the
   gNB A-MMSE hook and NMSE logger.
+- `OAI_AMMSE_CE_TEE_SOFTMODEM_LOG`: set `0` to disable mirroring
+  `nr-softmodem` stdout/stderr to `logs/nr-softmodem.log`.
 
 For RFsim experiments, online CE NMSE logging can be enabled without replacing
 the estimator:
 
 ```bash
 export OAI_CE_NMSE_ENABLE=1
-export OAI_CE_NMSE_CSV=/tmp/oai_ce_nmse.csv
+tail -f "${OAI_AMMSE_CE_OUTPUT_DIR}/metrics/ce_nmse.csv"
 ```
 
 The NMSE logger compares the applied channel estimate, the stock OAI
