@@ -4,6 +4,24 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OAI_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
+CONFIG_FILE="${OAI_AMMSE_CE_CONFIG_FILE:-}"
+if [[ "${1:-}" == "--ammse-config" || "${1:-}" == "--ammse-env-file" ]]; then
+  if [[ $# -lt 2 ]]; then
+    echo "$1 requires a config file path." >&2
+    exit 1
+  fi
+  CONFIG_FILE="$2"
+  shift 2
+fi
+if [[ -n "${CONFIG_FILE}" ]]; then
+  if [[ ! -f "${CONFIG_FILE}" ]]; then
+    echo "A-MMSE CE config file not found: ${CONFIG_FILE}" >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "${CONFIG_FILE}"
+fi
+
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 NR_SOFTMODEM="${NR_SOFTMODEM:-${OAI_ROOT}/cmake_targets/ran_build_local/build/nr-softmodem}"
 OAI_BUILD_DIR="$(cd "$(dirname "${NR_SOFTMODEM}")" && pwd)"

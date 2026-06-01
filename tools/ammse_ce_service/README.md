@@ -15,6 +15,8 @@ for the scheduled PUSCH resources.
   and input preprocessing code used by the service at inference time.
 - `run_oai_with_elastic_ammse.sh`: wrapper that starts the service, exports the
   required OAI environment variables, then launches `nr-softmodem`.
+- `configs/rayleigh8.env`: sourceable bash/zsh config for the default Rayleigh8
+  RFsim evaluation run.
 - `checkpoints/strujepa_best.pt`: optional local StruJEPA elastic A-MMSE
   checkpoint path. Large checkpoints are intentionally not committed to this
   public fork.
@@ -54,7 +56,7 @@ export OAI_AMMSE_CE_CHECKPOINT=/path/to/strujepa_best.pt
 Run the following from the OAI repository root unless noted otherwise:
 
 ```bash
-cd /home/users/dky/openairinterface5g
+cd /path/to/openairinterface5g
 ```
 
 1. Build the gNB, nrUE, and RFsim targets.
@@ -86,30 +88,28 @@ ls -lh tools/ammse_ce_service/checkpoints/strujepa_best.pt
 Alternatively keep the checkpoint anywhere and pass its absolute path with
 `OAI_AMMSE_CE_CHECKPOINT`.
 
-3. Configure the Python service environment.
+3. Load the runtime config.
 
 ```bash
-export OAI_BUILD_DIR=/home/users/dky/openairinterface5g/cmake_targets/ran_build_local/build
-export LD_LIBRARY_PATH="${OAI_BUILD_DIR}:${LD_LIBRARY_PATH:-}"
-export PYTHON_BIN="$(python -c 'import sys; print(sys.executable)')"
-export OAI_AMMSE_CE_CHECKPOINT=/home/users/dky/openairinterface5g/tools/ammse_ce_service/checkpoints/strujepa_best.pt
-export OAI_AMMSE_CE_OUTPUT_DIR=/home/users/dky/openairinterface5g/tools/ammse_ce_service/runs/rayleigh8_$(date +%Y%m%d_%H%M%S)
-export OAI_AMMSE_CE_PRINT_EVERY=100
-export OAI_CE_NMSE_PERIOD=100
-export OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD=1
-export OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL=Rayleigh8
-export OAI_AMMSE_CE_RFSIM_SPEED_KMH=0
-export OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB=-70
-export OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}"
-export OAI_AMMSE_CE_TIMING_PRINT_EVERY=100
+source tools/ammse_ce_service/configs/rayleigh8.env
 
 "${PYTHON_BIN}" -c 'import numpy, torch'
 ```
 
-Use the absolute Python path from the active environment. Passing plain
-`python3` through `sudo` can select the system Python, which may not have
-`numpy` or `torch`. The last command is a quick dependency check for the Python
-service. The service imports its own runtime code from `tools/ammse_ce_service`.
+The config file derives paths from the repository checkout, sets the active
+Python interpreter path, points to the default checkpoint location, enables
+Rayleigh8 RFsim channel modeling, and creates a timestamped run directory under
+`tools/ammse_ce_service/runs/`. Source it from the active Python environment;
+passing plain `python3` through `sudo` can select the system Python, which may
+not have `numpy` or `torch`.
+
+Override a setting after sourcing the file, for example:
+
+```bash
+export OAI_AMMSE_CE_RFSIM_SPEED_KMH=30
+export OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB=-80
+export OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}"
+```
 
 4. Start the gNB through the A-MMSE wrapper.
 
@@ -117,45 +117,30 @@ The wrapper starts `serve_elastic_ammse_ce.py`, waits for the Unix socket, expor
 the socket/subnet variables, and then starts `nr-softmodem`.
 
 ```bash
-sudo -E env \
-  PYTHON_BIN="${PYTHON_BIN}" \
-  LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
-  OAI_AMMSE_CE_OUTPUT_DIR="${OAI_AMMSE_CE_OUTPUT_DIR}" \
-  OAI_AMMSE_CE_METHOD=strujepa \
-  OAI_AMMSE_CE_CHECKPOINT="${OAI_AMMSE_CE_CHECKPOINT}" \
-  OAI_AMMSE_CE_WIDTH=0.25 \
-  OAI_AMMSE_CE_DEPTH=0.25 \
-  OAI_AMMSE_CE_NOISE_POWER_DB="${OAI_AMMSE_CE_NOISE_POWER_DB}" \
-  OAI_AMMSE_CE_PRINT_EVERY="${OAI_AMMSE_CE_PRINT_EVERY}" \
-  OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD="${OAI_AMMSE_CE_ENABLE_RFSIM_CHANMOD}" \
-  OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL="${OAI_AMMSE_CE_RFSIM_CHANNEL_MODEL}" \
-  OAI_AMMSE_CE_RFSIM_SPEED_KMH="${OAI_AMMSE_CE_RFSIM_SPEED_KMH}" \
-  OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB="${OAI_AMMSE_CE_RFSIM_NOISE_POWER_DB}" \
-  OAI_AMMSE_CE_TIMING_PRINT_EVERY="${OAI_AMMSE_CE_TIMING_PRINT_EVERY}" \
-  OAI_CE_NMSE_ENABLE=1 \
-  OAI_CE_NMSE_PERIOD="${OAI_CE_NMSE_PERIOD}" \
-  tools/ammse_ce_service/run_oai_with_elastic_ammse.sh \
-    --rfsim \
-    --phy-test \
-    --noS1 \
-    -O ci-scripts/conf_files/gnb.band78.106prb.rfsim.phytest-strujepa.conf \
-    '--rfsimulator.[0].serveraddr' server \
-    --T_stdout 2 \
-    --T_nowait
+sudo -E tools/ammse_ce_service/run_oai_with_elastic_ammse.sh \
+  --rfsim \
+  --phy-test \
+  --noS1 \
+  -O ci-scripts/conf_files/gnb.band78.106prb.rfsim.phytest-strujepa.conf \
+  '--rfsimulator.[0].serveraddr' server \
+  --T_stdout 2 \
+  --T_nowait
 ```
 
-Use `sudo -E env ...` if your OAI run needs sudo; it preserves the variables the
-wrapper and Python service need. The wrapper also adds the `nr-softmodem` build
-directory to `LD_LIBRARY_PATH`, but exporting it here makes the same setting
-available to commands you run outside the wrapper. By default this wrapper keeps
-all generated files under `tools/ammse_ce_service/runs/<run_id>/` rather than
-`/tmp`, and mirrors the gNB stdout/stderr to
+Use `sudo -E` if your OAI run needs sudo; it preserves the variables loaded from
+`configs/rayleigh8.env`. The wrapper also accepts
+`--ammse-config tools/ammse_ce_service/configs/rayleigh8.env` or
+`OAI_AMMSE_CE_CONFIG_FILE=...` if you want it to source a config file directly.
+By default this wrapper keeps all generated files under
+`tools/ammse_ce_service/runs/<run_id>/` rather than `/tmp`, and mirrors the gNB
+stdout/stderr to
 `${OAI_AMMSE_CE_OUTPUT_DIR}/logs/nr-softmodem.log`.
 
 5. Start the nrUE in another terminal.
 
 ```bash
-cd /home/users/dky/openairinterface5g
+cd /path/to/openairinterface5g
+source tools/ammse_ce_service/configs/rayleigh8.env
 
 sudo -E env \
   LD_LIBRARY_PATH="${LD_LIBRARY_PATH}" \
@@ -208,6 +193,8 @@ A-MMSE service.
 ## Basic Run
 
 ```bash
+source tools/ammse_ce_service/configs/rayleigh8.env
+
 OAI_AMMSE_CE_METHOD=strujepa \
 OAI_AMMSE_CE_WIDTH=0.25 \
 OAI_AMMSE_CE_DEPTH=0.25 \
